@@ -97,6 +97,11 @@ class BaseReasoningFormatDetector:
             current_text = current_text.replace(self.think_start_token, "")
             self.stripped_think_start = True
             self._in_reasoning = True
+            # Keep the buffer in sync with the stripped text; otherwise the
+            # un-stripped <think> token leaks into reasoning_text when
+            # stream_reasoning is disabled (the buffer is otherwise only
+            # cleared in the streaming path).
+            self._buffer = current_text
 
         # Handle end of reasoning block
         if self._in_reasoning and self.think_end_token in current_text:

@@ -576,5 +576,156 @@ class TestStreamOptionsUsage(unittest.TestCase):
         assert finishes[-1] == "tool_calls"
 
 
+TOOLS = [C.make_tool("get_weather", {"city": {"type": "string"}})]
+
+
+NEWLINE = chr(10)
+
+
+class TestFinalizationAndProtocolEdges(unittest.TestCase):
+    """Adversarial edge cases found during re-verification."""
+
+    def _stream(self, events):
+        tm = Mock()
+        tm.model_config = Mock(is_multimodal=False)
+        tm.server_args = Mock(
+            reasoning_parser="qwen3",
+            tool_call_parser="qwen3_coder",
+            enable_cache_report=False,
+        )
+
+        async def gen(_a, _r=None):
+            for e in events:
+                yield e
+
+        tm.generate_request = gen
+        return OpenAIServingChat(tm, Mock())
+
+    @staticmethod
+    def _ev(idx, text, finish, rid="x"):
+        return {
+            "index": idx,
+            "text": text,
+            "meta_info": {
+                "id": rid,
+                "prompt_tokens": 8,
+                "completion_tokens": 1,
+                "cached_tokens": 0,
+                "finish_reason": finish,
+            },
+        }
+
+    def _scan(self, chunks):
+        args, finish, reasoning = {}, None, ""
+        for c in chunks:
+            if c == "[DONE]":
+                continue
+            ch = c["choices"][0]
+            for t in ch["delta"].get("tool_calls") or []:
+                args[t["index"]] = args.get(t["index"], "") + (t["function"].get("arguments") or "")
+            if ch["finish_reason"]:
+                finish = ch["finish_reason"]
+            reasoning += ch["delta"].get("reasoning_content") or ""
+        return args, finish, reasoning
+
+    def test_finish_event_with_tool_tail_in_same_delta(self):
+        """Finish event whose delta carries the whole tool-call tail: the
+        finalization must flush remaining args exactly once (no doubled
+        closing brace, no duplicated arguments)."""
+        events = [self._ev(0, "", None)]
+        cum = ""
+        for i, piece in enumerate(
+            ["<think>", "r", "</think>", "N", "<tool_call>", "<function=get_weather>",
+             "<parameter=city>", "Tokyo", "</parameter>", "</function>", "</tool_call>"]
+        ):
+            cum += piece
+            last = piece == "</tool_call>"
+            events.append(
+                self._ev(0, cum, {"type": "stop", "matched": None} if last else None)
+            )
+        chat = self._stream(events)
+        chunks = _collect_sse(chat, _request(stream=True, thinking=True, tools=TOOLS))
+        args, finish, _ = self._scan(chunks)
+        assert json.loads(args[0]) == {"city": "Tokyo"}
+        assert finish == "tool_calls"
+        assert chunks[-1] == "[DONE]"
+
+    def test_finish_event_in_separate_empty_delta(self):
+        """Real detokenizer behavior: </tool_call> streams first, the finish
+        event arrives separately with an empty delta."""
+        events = [self._ev(0, "", None)]
+        cum = ""
+        for piece in ["<think>", "r", "</think>", "N", "<tool_call>",
+                      "<function=get_weather>", "<parameter=city>", "Tokyo",
+                      "</parameter>", "</function>", "</tool_call>"]:
+            cum += piece
+            events.append(self._ev(0, cum, None))
+        events.append(self._ev(0, cum, {"type": "stop", "matched": None}))
+        chat = self._stream(events)
+        chunks = _collect_sse(chat, _request(stream=True, thinking=True, tools=TOOLS))
+        args, finish, _ = self._scan(chunks)
+        assert json.loads(args[0]) == {"city": "Tokyo"}
+        assert finish == "tool_calls"
+
+    def test_every_choice_gets_finish_chunk_n2(self):
+        """n=2 stream: EACH choice must receive its own finish_reason chunk
+        (the finish chunk used to be emitted once, after the loop, using the
+        last event's variables - dropping it for all but the last choice)."""
+        events = []
+        for idx in (0, 1):
+            cum = ""
+            events.append(self._ev(idx, "", None, rid=f"n{idx}"))
+            for piece in ["<think>", "r", "</think>", "N", "<tool_call>",
+                          "<function=get_weather>", "<parameter=city>",
+                          "Tokyo" if idx == 0 else "Paris",
+                          "</parameter>", "</function>", "</tool_call>"]:
+                cum += piece
+                last = piece == "</tool_call>"
+                events.append(self._ev(idx, cum,
+                                       {"type": "stop", "matched": None} if last else None,
+                                       rid=f"n{idx}"))
+        chat = self._stream(events)
+        chunks = _collect_sse(chat, _request(stream=True, thinking=True, tools=TOOLS))
+        finishes = {}
+        args = {}
+        for c in chunks:
+            if c == "[DONE]":
+                continue
+            ch = c["choices"][0]
+            if ch["finish_reason"]:
+                finishes[ch["index"]] = ch["finish_reason"]
+            for t in ch["delta"].get("tool_calls") or []:
+                args.setdefault(ch["index"], {})
+                i = t["index"]
+                args[ch["index"]][i] = args[ch["index"]].get(i, "") + (t["function"].get("arguments") or "")
+        assert finishes == {0: "tool_calls", 1: "tool_calls"}
+        assert json.loads(args[0][0]) == {"city": "Tokyo"}
+        assert json.loads(args[1][0]) == {"city": "Paris"}
+        assert chunks[-1] == "[DONE]"
+
+    def test_stream_reasoning_false_thinking_plus_tools(self):
+        """stream_reasoning=false: reasoning is buffered; the <think> token
+        must not leak into reasoning_content and the tool call must still
+        produce valid arguments."""
+        events = [self._ev(0, "", None)]
+        cum = ""
+        for i, piece in enumerate(["<think>", "secret plan", "</think>", "N", "<tool_call>",
+                                   "<function=get_weather>", "<parameter=city>", "Tokyo",
+                                   "</parameter>", "</function>", "</tool_call>"]):
+            cum += piece
+            last = piece == "</tool_call>"
+            events.append(self._ev(0, cum,
+                                   {"type": "stop", "matched": None} if last else None))
+        chat = self._stream(events)
+        request = _request(stream=True, thinking=True, tools=TOOLS)
+        request.stream_reasoning = False
+        chunks = _collect_sse(chat, request)
+        args, finish, reasoning = self._scan(chunks)
+        assert "<think>" not in reasoning
+        assert "secret plan" in reasoning
+        assert json.loads(args[0]) == {"city": "Tokyo"}
+        assert finish == "tool_calls"
+
+
 if __name__ == "__main__":
     unittest.main()

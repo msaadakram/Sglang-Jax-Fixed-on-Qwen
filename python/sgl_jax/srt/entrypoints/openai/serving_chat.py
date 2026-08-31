@@ -447,6 +447,40 @@ Assistant: {% endif %}"""
         # Tracks choices that streamed at least one tool call, so the final
         # chunk can report finish_reason="tool_calls" (OpenAI protocol).
         tool_emitted = {}
+        # Choices whose finish_reason chunk has already been sent. The chunk
+        # must be emitted per choice when ITS finish event arrives; emitting
+        # it once after the loop would drop finish_reason for every choice
+        # except the last one in n>1 streams.
+        emitted_finish = set()
+
+        def _build_finish_chunk(
+            content: dict[str, Any], index: int, finish_reason_type: str | None
+        ) -> str:
+            final_finish_reason_type = (
+                "tool_calls"
+                if finish_reason_type == "stop" and tool_emitted.get(index)
+                else finish_reason_type
+            )
+            finish_reason = content["meta_info"]["finish_reason"]
+            chunk = ChatCompletionStreamResponse(
+                id=content["meta_info"]["id"],
+                created=int(time.time()),
+                choices=[
+                    ChatCompletionResponseStreamChoice(
+                        index=index,
+                        delta=DeltaMessage(),
+                        finish_reason=final_finish_reason_type,
+                        matched_stop=(
+                            finish_reason["matched"]
+                            if finish_reason and "matched" in finish_reason
+                            else None
+                        ),
+                    )
+                ],
+                model=request.model,
+                usage=None,
+            )
+            return f"data: {chunk.model_dump_json()}\n\n"
 
         # State tracking for streaming
         is_firsts = {}
@@ -533,6 +567,9 @@ Assistant: {% endif %}"""
                         yield f"data: {chunk.model_dump_json()}\n\n"
 
                     if not delta:
+                        if finish_reason_type is not None and index not in emitted_finish:
+                            emitted_finish.add(index)
+                            yield _build_finish_chunk(content, index, finish_reason_type)
                         continue
 
                 # Handle tool calls
@@ -576,33 +613,18 @@ Assistant: {% endif %}"""
                         )
                         yield f"data: {chunk.model_dump_json()}\n\n"
 
-            # Final chunk with finish_reason. When tool calls were streamed,
-            # the protocol requires finish_reason="tool_calls" (the engine's
-            # raw finish reason is "stop").
-            final_finish_reason_type = (
-                "tool_calls"
-                if finish_reason_type == "stop" and tool_emitted.get(index)
-                else finish_reason_type
-            )
-            finish_reason_chunk = ChatCompletionStreamResponse(
-                id=content["meta_info"]["id"],
-                created=int(time.time()),
-                choices=[
-                    ChatCompletionResponseStreamChoice(
-                        index=index,
-                        delta=DeltaMessage(),
-                        finish_reason=final_finish_reason_type,
-                        matched_stop=(
-                            finish_reason["matched"]
-                            if finish_reason and "matched" in finish_reason
-                            else None
-                        ),
-                    )
-                ],
-                model=request.model,
-                usage=None,
-            )
-            yield f"data: {finish_reason_chunk.model_dump_json()}\n\n"
+                # Final chunk for this choice. When tool calls were streamed,
+                # the protocol requires finish_reason="tool_calls" (the
+                # engine's raw finish reason is "stop").
+                if finish_reason_type is not None and index not in emitted_finish:
+                    emitted_finish.add(index)
+                    yield _build_finish_chunk(content, index, finish_reason_type)
+
+            # Safety net: a choice that streamed content but never received a
+            # finish_reason event still gets a terminating chunk.
+            for unfinished_index in list(stream_buffers.keys()):
+                if unfinished_index not in emitted_finish:
+                    yield _build_finish_chunk(content, unfinished_index, None)
 
             # Send hidden states if requested
             if request.return_hidden_states and hidden_states:
@@ -962,6 +984,32 @@ Assistant: {% endif %}"""
             )
             yield f"data: {chunk.model_dump_json()}\n\n"
 
+        # Finalize remaining arguments exactly once. The detector has already
+        # recorded everything it streamed (including this batch) in
+        # streamed_args_for_tool; anything still missing from the expected
+        # JSON is appended to the LAST item of this batch. Recomputing the
+        # diff per item would double-count arguments, because each per-item
+        # diff subtracted from state that already includes them.
+        if finish_reason_type == "stop" and calls:
+            last_item = calls[-1]
+            tool_index = last_item.tool_index
+            if (
+                tool_index is not None
+                and 0 <= tool_index < len(parser.detector.prev_tool_call_arr)
+                and tool_index < len(parser.detector.streamed_args_for_tool)
+            ):
+                expected_call = json.dumps(
+                    parser.detector.prev_tool_call_arr[tool_index].get("arguments", {}),
+                    ensure_ascii=False,
+                )
+                streamed_call = parser.detector.streamed_args_for_tool[tool_index]
+                if streamed_call and expected_call.startswith(streamed_call):
+                    remaining_call = expected_call[len(streamed_call) :]
+                else:
+                    remaining_call = ""
+                if remaining_call:
+                    last_item.parameters = (last_item.parameters or "") + remaining_call
+
         # Yield tool calls
         for call_item in calls:
             # Tool call ID should be generated only once per tool call
@@ -973,33 +1021,6 @@ Assistant: {% endif %}"""
                 # Subsequent chunks: null ID and name for argument deltas
                 tool_call_id = None
                 function_name = None
-
-            if finish_reason_type == "stop":
-                # Handle remaining arguments
-                latest_delta_len = 0
-                if isinstance(call_item.parameters, str):
-                    latest_delta_len = len(call_item.parameters)
-
-                # Index detector state by the TOOL index of the item being
-                # finalized, not the choice index. With multiple parallel tool
-                # calls the choice index points at the wrong tool and corrupts
-                # the remaining-arguments computation.
-                tool_index = call_item.tool_index
-                if tool_index is None or tool_index < 0 or tool_index >= len(
-                    parser.detector.prev_tool_call_arr
-                ):
-                    continue
-                expected_call = json.dumps(
-                    parser.detector.prev_tool_call_arr[tool_index].get("arguments", {}),
-                    ensure_ascii=False,
-                )
-                actual_call = parser.detector.streamed_args_for_tool[tool_index]
-                if latest_delta_len > 0:
-                    actual_call = actual_call[:-latest_delta_len]
-                remaining_call = expected_call.replace(actual_call, "", 1)
-                call_item.parameters = remaining_call
-                # finish_reason="tool_calls" is reported on the final stream
-                # chunk (see tool_emitted in _generate_chat_stream).
 
             tool_call = ToolCall(
                 id=tool_call_id,
