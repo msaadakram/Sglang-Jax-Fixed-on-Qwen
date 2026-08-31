@@ -66,6 +66,17 @@ class Qwen3CoderDetector(BaseFormatDetector):
         self._in_tool_call: bool = False
         self._function_name_sent: bool = False
 
+    def _partial_start_token_suffix(self, text: str) -> str:
+        """Return the longest proper suffix of ``text`` that is a prefix of
+        the tool-call start token. Keeping such a suffix buffered prevents a
+        start token split across streaming increments from being consumed as
+        normal text (the tool call would then never be detected)."""
+        token = self.tool_call_start_token
+        for k in range(min(len(token) - 1, len(text)), 0, -1):
+            if text.endswith(token[:k]):
+                return text[-k:]
+        return ""
+
     def has_tool_call(self, text: str) -> bool:
         return self.tool_call_start_token in text
 
@@ -85,16 +96,22 @@ class Qwen3CoderDetector(BaseFormatDetector):
         while True:
             # If we're not in a tool call and don't see a start token, return normal text
             if not self._in_tool_call and self.tool_call_start_token not in self._buf:
-                normal += self._buf
-                self._buf = ""
+                # Hold back a trailing partial start token (e.g. "<tool_ca") so
+                # a <tool_call> split across detokenizer events is not
+                # flushed as normal text and lost. It stays buffered until
+                # the tag completes (or is proven not to be a tag).
+                holdback = self._partial_start_token_suffix(self._buf)
+                normal += self._buf[: len(self._buf) - len(holdback)]
+                self._buf = holdback
                 break
 
             # Look for tool call start
             if not self._in_tool_call:
                 s = self._buf.find(self.tool_call_start_token)
                 if s == -1:
-                    normal += self._buf
-                    self._buf = ""
+                    holdback = self._partial_start_token_suffix(self._buf)
+                    normal += self._buf[: len(self._buf) - len(holdback)]
+                    self._buf = holdback
                     break
 
                 normal += self._buf[:s]

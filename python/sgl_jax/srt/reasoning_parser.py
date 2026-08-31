@@ -139,10 +139,18 @@ class BaseReasoningFormatDetector:
             else:
                 return StreamingParseResult()
 
-        # If we're not in a reasoning block return as normal text
+        # If we're not in a reasoning block return as normal text. Return the
+        # whole buffer, not just new_text: the early prefix check above may
+        # have held back a partial "<" (a potential <think>/<tool_call> tag
+        # start) from a previous increment. Returning only new_text would
+        # silently drop it -- a following <tool_call> split at the "<"
+        # boundary then loses its start token and the tool call is never
+        # detected in streaming mode (non-streaming is unaffected because it
+        # sees the full text.
         if not self._in_reasoning:
+            normal_text = current_text
             self._buffer = ""
-            return StreamingParseResult(normal_text=new_text)
+            return StreamingParseResult(normal_text=normal_text)
 
         return StreamingParseResult()
 

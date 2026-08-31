@@ -727,5 +727,65 @@ class TestFinalizationAndProtocolEdges(unittest.TestCase):
         assert finish == "tool_calls"
 
 
+NEWLINE = chr(10)
+
+
+class TestControlTagSplitAcrossEvents(unittest.TestCase):
+    """A control tag split across detokenizer events must never be lost.
+
+    Stream-only failure mode: a detokenizer event that is a strict prefix of
+    <think>/<tool_call> (e.g. a lone "<") is held by the reasoning parser's
+    prefix check; the post-reasoning path used to return only the new text,
+    silently dropping the held fragment -- a following <tool_call> then lost
+    its start token and the tool call was never detected in streaming mode.
+    """
+
+    TEXT = (
+        "<think>" + NEWLINE + "reason" + NEWLINE + "</think>" + NEWLINE + NEWLINE
+        + "<tool_call>" + NEWLINE + "<function=get_weather>" + NEWLINE
+        + "<parameter=city>" + NEWLINE + "Tokyo" + NEWLINE + "</parameter>"
+        + NEWLINE + "</function>" + NEWLINE + "</tool_call>"
+    )
+
+    def _run_chain(self, tag: str, split_at: int):
+        pre, post = self.TEXT.split(tag, 1)
+        events = [e for e in [pre, tag[:split_at], tag[split_at:], post] if e]
+        reasoning = ReasoningParser("qwen3", stream_reasoning=True)
+        fc = FunctionCallParser(TOOLS, "qwen3_coder")
+        names, args_fragments = [], ""
+        for ev in events:
+            _, delta = reasoning.parse_stream_chunk(ev)
+            if delta:
+                _, calls = fc.parse_stream_chunk(delta)
+                for c in calls:
+                    if c.name:
+                        names.append(c.name)
+                    args_fragments += c.parameters or ""
+        return names, args_fragments
+
+    def test_think_end_tag_split_at_every_position(self):
+        for k in range(1, 8):
+            with self.subTest(tag="</think>", split=k):
+                names, frag = self._run_chain("</think>", k)
+                self.assertEqual(names, ["get_weather"])
+                self.assertEqual(json.loads(frag), {"city": "Tokyo"})
+
+    def test_tool_call_tag_split_at_every_position(self):
+        for k in range(1, 10):
+            with self.subTest(tag="<tool_call>", split=k):
+                names, frag = self._run_chain("<tool_call>", k)
+                self.assertEqual(names, ["get_weather"])
+                self.assertEqual(json.loads(frag), {"city": "Tokyo"})
+
+    def test_lone_lt_character_after_reasoning_is_preserved(self):
+        """A "<" in post-reasoning text (e.g. "5 < 10") must not be dropped."""
+        reasoning = ReasoningParser("qwen3", stream_reasoning=True)
+        out = ""
+        for piece in ["<think>", "r", "</think>", "5 <", " 10 and 3 <", " 4"]:
+            _, delta = reasoning.parse_stream_chunk(piece)
+            out += delta or ""
+        self.assertEqual(out, "5 < 10 and 3 < 4")
+
+
 if __name__ == "__main__":
     unittest.main()
