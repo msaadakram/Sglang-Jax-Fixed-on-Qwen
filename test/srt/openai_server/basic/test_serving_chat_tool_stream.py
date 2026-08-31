@@ -30,6 +30,8 @@ from unittest.mock import Mock
 from sgl_jax.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     StreamOptions,
+    ToolChoice,
+    ToolChoiceFuncName,
 )
 from sgl_jax.srt.entrypoints.openai.serving_chat import OpenAIServingChat
 from sgl_jax.srt.function_call.function_call_parser import FunctionCallParser
@@ -785,6 +787,87 @@ class TestControlTagSplitAcrossEvents(unittest.TestCase):
             _, delta = reasoning.parse_stream_chunk(piece)
             out += delta or ""
         self.assertEqual(out, "5 < 10 and 3 < 4")
+
+
+NEWLINE = chr(10)
+
+
+class TestForcedToolChoice(unittest.TestCase):
+    """Forced tool_choice + thinking previously produced a 1-token response:
+    the json_schema constraint masked <think> at step 0, so at temperature 0
+    the model deterministically emitted the EOS/stop token
+    (completion_tokens=1, matched_stop=<stop id>, finish_reason=stop).
+    Forced tool_choice with thinking now uses a thinking-tolerant structural
+    tag (free reasoning, then the native <tool_call> structure)."""
+
+    def _constraint(self, tool_choice, thinking):
+        p = FunctionCallParser(TOOLS, "qwen3_coder")
+        return p.get_structure_constraint(tool_choice, thinking=thinking)
+
+    def test_constraint_selection_matrix(self):
+        self.assertIsNone(self._constraint("auto", thinking=True))
+        self.assertEqual(self._constraint("required", thinking=True)[0], "structural_tag")
+        self.assertEqual(
+            self._constraint(
+                ToolChoice(type="function", function=ToolChoiceFuncName(name="get_weather")),
+                thinking=True,
+            )[0],
+            "structural_tag",
+        )
+        # thinking disabled keeps the historical json_schema path
+        self.assertEqual(self._constraint("required", thinking=False)[0], "json_schema")
+
+    def test_thinking_tag_carries_lark_grammars(self):
+        kind, value = self._constraint("required", thinking=True)
+        d = value.model_dump(by_alias=True)
+        self.assertIn("lark_grammars", d)
+        self.assertIn("struct_tag", d["lark_grammars"])
+        self.assertIn("tag_body", d["lark_grammars"])
+        main = d["lark_grammars"]["struct_tag"]
+        # bare special-token references (quoted literals cannot match them)
+        self.assertIn("think_part: <think>", main)
+        self.assertIn("</think>", main)
+        self.assertIn("@tag_body", main)
+
+    def test_forced_tool_call_with_thinking_non_stream(self):
+        text = THINK_BLOCK + tool_call_xml("get_weather", {"city": "Tokyo"})
+        chat = _make_chat(text)
+        request = _request(stream=False, thinking=True, tools=TOOLS)
+        request.tool_choice = "required"
+        ret = {
+            "index": 0, "text": text,
+            "meta_info": {"id": "c", "prompt_tokens": 8, "completion_tokens": 40,
+                          "cached_tokens": 0,
+                          "finish_reason": {"type": "stop", "matched": None}},
+        }
+        resp = chat._build_chat_response(request, [ret], int(time.time()))
+        choice = resp.choices[0]
+        self.assertEqual(choice.finish_reason, "tool_calls")
+        self.assertIsNotNone(choice.message.tool_calls)
+        self.assertEqual(choice.message.tool_calls[0].index, 0)
+        self.assertEqual(choice.message.tool_calls[0].function.name, "get_weather")
+        self.assertEqual(json.loads(choice.message.tool_calls[0].function.arguments), {"city": "Tokyo"})
+        self.assertTrue(choice.message.reasoning_content)
+
+    def test_forced_tool_call_with_thinking_stream(self):
+        text = THINK_BLOCK + tool_call_xml("get_weather", {"city": "Tokyo"})
+        chat = _make_chat(text)
+        request = _request(stream=True, thinking=True, tools=TOOLS)
+        request.tool_choice = "required"
+        chunks = _collect_sse(chat, request)
+        args, finish, done = {}, None, False
+        for c in chunks:
+            if c == "[DONE]":
+                done = True
+                continue
+            ch = c["choices"][0]
+            for t in ch["delta"].get("tool_calls") or []:
+                args[t["index"]] = args.get(t["index"], "") + (t["function"].get("arguments") or "")
+            if ch["finish_reason"]:
+                finish = ch["finish_reason"]
+        self.assertEqual(json.loads(args[0]), {"city": "Tokyo"})
+        self.assertEqual(finish, "tool_calls")
+        self.assertTrue(done)
 
 
 if __name__ == "__main__":

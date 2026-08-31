@@ -359,6 +359,15 @@ class Qwen3CoderDetector(BaseFormatDetector):
     def supports_structural_tag(self) -> bool:
         return False
 
+    @property
+    def supports_lark_structural_tag(self) -> bool:
+        """The XML-ish call format cannot use the JSON-body structural tag,
+        but it is expressible as a Lark grammar, which llguidance structural
+        tags accept. Unlike a from-token-0 grammar, the tag's surrounding
+        free text is a lazy lexeme, so thinking (<think>...</think>) can
+        precede the tool call without tripping the grammar."""
+        return True
+
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError
 

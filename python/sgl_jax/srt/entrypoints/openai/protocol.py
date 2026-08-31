@@ -335,6 +335,14 @@ class ResponseFormat(BaseModel):
 class StructuresResponseFormat(BaseModel):
     begin: str
     schema_: dict[str, object] | None = Field(alias="schema", default=None)
+    # Optional full Lark grammar (with a "start:" rule) for the structure
+    # body. Takes precedence over schema_ when set. Required for detectors
+    # whose native tool-call format is not JSON-compatible (e.g. the
+    # XML-ish qwen3_coder format), and it makes the tag thinking-tolerant:
+    # llguidance implements the surrounding free text as a lazy lexeme, so
+    # <think>...</think> reasoning can precede the structure without
+    # tripping the grammar.
+    lark_grammar: str | None = None
     end: str
 
 
@@ -342,6 +350,11 @@ class StructuralTagResponseFormat(BaseModel):
     type: Literal["structural_tag"]
     structures: list[StructuresResponseFormat]
     triggers: list[str]
+    # Optional named Lark grammars: when present, the value is a complete
+    # llguidance multi-grammar definition ("grammars" key) instead of the
+    # flat structures/triggers form. Used by thinking-tolerant tool-call
+    # constraints (see FunctionCallParser._build_thinking_structural_tag).
+    lark_grammars: dict[str, str] | None = None
 
 
 class Function(BaseModel):

@@ -192,10 +192,23 @@ class GuidanceBackend(BaseGrammarBackend):
     def dispatch_structural_tag(self, key_string: str) -> GuidanceGrammar:
         try:
             structural_tag = json.loads(key_string)
+            if "grammars" not in structural_tag and structural_tag.get("lark_grammars"):
+                # Thinking-tolerant tag: assemble the llguidance multi-grammar
+                # definition from the named Lark grammars.
+                structural_tag = {
+                    "grammars": [
+                        {"name": name, "lark_grammar": lark}
+                        for name, lark in structural_tag["lark_grammars"].items()
+                    ]
+                }
+            if "grammars" in structural_tag:
+                # A llguidance multi-grammar definition (e.g. a
+                # thinking-tolerant tag whose body references sub-grammars).
+                return self._from_serialized(json.dumps(structural_tag))
             tags = [
                 StructTag(
                     begin=structure["begin"],
-                    grammar=structure["schema"],
+                    grammar=structure.get("lark_grammar") or structure["schema"],
                     end=structure["end"],
                     trigger=structural_tag["triggers"][0],  # TODO?
                 )

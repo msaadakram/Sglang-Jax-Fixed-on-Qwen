@@ -14,6 +14,7 @@ from sgl_jax.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sgl_jax.srt.function_call.mimo_detector import MiMoDetector
 from sgl_jax.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sgl_jax.srt.function_call.qwen25_detector import Qwen25Detector
+from sgl_jax.srt.function_call.ebnf_composer import EBNFComposer
 from sgl_jax.srt.function_call.utils import get_json_schema_constraint
 
 logger = logging.getLogger(__name__)
@@ -144,7 +145,9 @@ class FunctionCallParser:
         )
 
     def get_structure_constraint(
-        self, tool_choice: ToolChoice | Literal["auto", "required"]
+        self,
+        tool_choice: ToolChoice | Literal["auto", "required"],
+        thinking: bool = False,
     ) -> tuple[str, Any] | None:
         """
         Returns the appropriate structure constraint for tool calls based on the tool_choice.
@@ -152,6 +155,14 @@ class FunctionCallParser:
 
         Args:
             tool_choice: The tool choice setting from the request
+            thinking: Whether reasoning/thinking is enabled for this request.
+                When True, a from-token-0 grammar masks the <think> token the
+                model wants to emit first; at temperature 0 the model then
+                deterministically emits the EOS/stop token instead
+                (completion_tokens=1, finish_reason=stop, matched_stop=<stop id>).
+                For forced tool_choice we therefore compose the detector's
+                native EBNF with an optional <think>...</think> free-text
+                prefix so thinking and the tool grammar no longer conflict.
 
         Returns:
             A tuple of (constraint_type, constraint_value) to be added to sampling parameters,
@@ -167,10 +178,125 @@ class FunctionCallParser:
             strict_tag = self.get_structure_tag()
             return ("structural_tag", strict_tag)
         elif tool_choice == "required" or isinstance(tool_choice, ToolChoice):
+            if thinking:
+                tag = self._build_thinking_structural_tag(tool_choice)
+                if tag is not None:
+                    return ("structural_tag", tag)
+                logger.warning(
+                    "Detector does not support thinking-tolerant structural "
+                    "tags; falling back to json_schema for forced tool_choice "
+                    "(thinking conflicts with from-token-0 grammars)."
+                )
             json_schema = get_json_schema_constraint(self.tools, tool_choice)
             if json_schema is None:
                 return None
             return ("json_schema", json_schema)
+
+    def _filtered_tools(self, tool_choice: ToolChoice | Literal["required"]):
+        if isinstance(tool_choice, ToolChoice):
+            return [t for t in self.tools if t.function.name == tool_choice.function.name]
+        return self.tools
+
+    def _build_thinking_structural_tag(self, tool_choice) -> Any | None:
+        """Build a thinking-tolerant structural tag for forced tool_choice.
+
+        A from-token-0 grammar (json_schema) masks the <think> token a
+        thinking model emits first, which at temperature 0 collapses the
+        generation to a single EOS/stop token. A structural tag instead lets
+        llguidance run unconstrained free text (the reasoning) until the
+        <tool_call> trigger appears, then applies the detector's native
+        tool-call structure as a Lark grammar. Requires the detector's
+        call format to be expressible as Lark (Qwen3-Coder XML format is).
+        """
+        from llguidance import StructTag
+        from llguidance.gbnf_to_lark import any_to_lark
+
+        if not getattr(self.detector, "supports_lark_structural_tag", False):
+            return None
+        filtered = self._filtered_tools(tool_choice)
+        if not filtered:
+            return None
+        # Body of one tool call, without the <tool_call>/</tool_call>
+        # wrapper: the structural tag's begin/end supply it, and llguidance
+        # re-triggers on <tool_call> for parallel calls.
+        body_ebnf = EBNFComposer.build_ebnf(
+            filtered,
+            function_format="xml",
+            individual_call_start_token=None,
+            individual_call_end_token=None,
+            tool_call_separator=None,
+            call_rule_fmt='"<function={name}>\\n" {arguments_rule} "\\n</function>"',
+            key_value_rule_fmt='"<parameter={key}>\\n" {valrule} "\\n</parameter>"',
+            key_value_separator='"\\n"',
+        )
+        try:
+            body_lark = any_to_lark(body_ebnf)
+        except Exception as e:
+            logger.warning("Failed to convert tool-call EBNF to Lark: %s", e)
+            return None
+        # Strip the per-grammar %llguidance header: nested grammars in a
+        # multi-grammar definition carry no header (mirrors StructTag.to_grammar).
+        body_lark = "\n".join(
+            line for line in body_lark.splitlines() if not line.startswith("%llguidance")
+        )
+
+        # Main grammar: required <think>...</think> reasoning (bare special-
+        # token references -- quoted literals cannot match special tokens),
+        # then one or more <tool_call> structures via the trigger mechanism.
+        # The free text is a lazy lexeme (identical mechanism to
+        # StructTag.to_grammar), which is the only llguidance construct that
+        # supports "any text, then structure" without lexer-state explosion.
+        main_lark = (
+            "%llguidance {}\n\n"
+            "start: think_part tool_tag* trailing_text?\n"
+            "think_part: <think> /(.|\\n)*/ </think>\n"
+            "trailing_text: /(.|\\n)*/\n"
+            "tool_tag: TAG_TEXT <tool_call> @tag_body "
+            f'"{self.detector.tool_call_end_token}"\n'
+            "TAG_TEXT: /(.|\\n)*/\n"
+        )
+        from sgl_jax.srt.entrypoints.openai.protocol import (
+            StructuralTagResponseFormat,
+        )
+
+        # A "structural_tag" value whose "grammars" key carries the full
+        # llguidance multi-grammar definition (main + tool-call body).
+        return StructuralTagResponseFormat(
+            type="structural_tag",
+            structures=[],
+            triggers=[self.detector.tool_call_start_token],
+            lark_grammars={
+                "struct_tag": main_lark,
+                "tag_body": body_lark,
+            },
+        )
+
+    @staticmethod
+    def _compose_thinking_prefix(ebnf: str) -> str:
+        """Prepend a required <think>...</think> free-text prefix to a
+        grammar's start rule so a thinking model can reason before emitting
+        the constrained tool-call structure.
+
+        The detector's EBNF is in GBNF style, which llguidance converts to
+        Lark via llguidance.gbnf_to_lark.any_to_lark (the exact conversion
+        dispatch_ebnf performs). The free-text regex must be inserted AFTER
+        that conversion: GBNF conversion rejects inline regexes, while Lark
+        supports them natively. The prefix is required (not optional)
+        because thinking is enabled for these requests and llguidance's
+        mask computation degenerates for optional groups containing
+        free-text loops."""
+        try:
+            from llguidance.gbnf_to_lark import any_to_lark
+        except ImportError:  # pragma: no cover - older llguidance layouts
+            logger.warning("llguidance.gbnf_to_lark unavailable; cannot compose thinking prefix")
+            return ebnf
+        lark = any_to_lark(ebnf)
+        if "start:" not in lark:
+            logger.warning("Converted grammar has no start rule; cannot compose thinking prefix")
+            return ebnf
+        return lark.replace(
+            "start: ", 'start: "<think>" /(.|\\n)*/ "</think>" ', 1
+        )
 
     def get_ebnf(self, tool_choice: ToolChoice | Literal["required"]) -> str | None:
         """

@@ -129,12 +129,22 @@ class OpenAIServingChat(OpenAIServingBase):
 
             tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
             parser = FunctionCallParser(request.tools, tool_call_parser)
-            tool_call_constraint = parser.get_structure_constraint(request.tool_choice)
+            thinking_active = self._get_reasoning_from_request(request)
+            tool_call_constraint = parser.get_structure_constraint(
+                request.tool_choice, thinking=thinking_active
+            )
 
         # Structural_tag grammars block special tokens like <think>.
         # Disable thinking so the template injects an empty <think></think>
         # prefix instead of letting the model generate <think> itself.
-        if tool_call_constraint and tool_call_constraint[0] == "structural_tag":
+        # EXCEPTION: constraints built with thinking=True are thinking-aware
+        # (the tag's free text is a lazy lexeme, so <think>...</think> can
+        # precede the <tool_call> trigger) and must keep thinking enabled.
+        if (
+            tool_call_constraint
+            and tool_call_constraint[0] == "structural_tag"
+            and not self._get_reasoning_from_request(request)
+        ):
             if request.chat_template_kwargs is None:
                 request.chat_template_kwargs = {}
             if "enable_thinking" not in request.chat_template_kwargs:
