@@ -444,6 +444,9 @@ Assistant: {% endif %}"""
         # Parsers for tool calls and reasoning
         parser_dict = {}
         reasoning_parser_dict = {}
+        # Tracks choices that streamed at least one tool call, so the final
+        # chunk can report finish_reason="tool_calls" (OpenAI protocol).
+        tool_emitted = {}
 
         # State tracking for streaming
         is_firsts = {}
@@ -541,16 +544,18 @@ Assistant: {% endif %}"""
                         content,
                         request,
                         finish_reason_type,
+                        tool_emitted=tool_emitted,
                     ):
                         yield chunk
                 else:
-                    # Regular content
-                    if delta or not (
-                        request.stream_options and request.stream_options.include_usage
-                    ):
+                    # Regular content. Skip empty deltas: a standalone chunk
+                    # whose delta carries neither text nor tool_calls is
+                    # dropped (ref: sgl-project/sglang#29441 - empty content
+                    # chunks make AI SDK style consumers truncate the stream).
+                    if delta:
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
-                            delta=DeltaMessage(content=delta if delta else None),
+                            delta=DeltaMessage(content=delta),
                             finish_reason=(
                                 None
                                 if request.stream_options and request.stream_options.include_usage
@@ -571,7 +576,14 @@ Assistant: {% endif %}"""
                         )
                         yield f"data: {chunk.model_dump_json()}\n\n"
 
-            # Final chunk with finish_reason
+            # Final chunk with finish_reason. When tool calls were streamed,
+            # the protocol requires finish_reason="tool_calls" (the engine's
+            # raw finish reason is "stop").
+            final_finish_reason_type = (
+                "tool_calls"
+                if finish_reason_type == "stop" and tool_emitted.get(index)
+                else finish_reason_type
+            )
             finish_reason_chunk = ChatCompletionStreamResponse(
                 id=content["meta_info"]["id"],
                 created=int(time.time()),
@@ -579,7 +591,7 @@ Assistant: {% endif %}"""
                     ChatCompletionResponseStreamChoice(
                         index=index,
                         delta=DeltaMessage(),
-                        finish_reason=finish_reason_type,
+                        finish_reason=final_finish_reason_type,
                         matched_stop=(
                             finish_reason["matched"]
                             if finish_reason and "matched" in finish_reason
@@ -815,11 +827,16 @@ Assistant: {% endif %}"""
                 tool_calls = [
                     ToolCall(
                         id=f"call_{uuid.uuid4().hex[:24]}",
+                        # OpenAI protocol: tool_calls must carry a numeric
+                        # 0-based index (ref: sgl-project/sglang#5661).
+                        index=call_info.tool_index
+                        if call_info.tool_index >= 0
+                        else i,
                         function=FunctionResponse(
                             name=call_info.name, arguments=call_info.parameters
                         ),
                     )
-                    for call_info in call_info_list
+                    for i, call_info in enumerate(call_info_list)
                 ]
                 return tool_calls, text, finish_reason
             except Exception as e:
@@ -843,12 +860,15 @@ Assistant: {% endif %}"""
                     tool_calls = [
                         ToolCall(
                             id=f"call_{uuid.uuid4().hex[:24]}",
+                            index=call_info.tool_index
+                            if call_info.tool_index >= 0
+                            else i,
                             function=FunctionResponse(
                                 name=call_info.name,
                                 arguments=call_info.parameters,
                             ),
                         )
-                        for call_info in call_info_list
+                        for i, call_info in enumerate(call_info_list)
                     ]
                     return tool_calls, "", finish_reason
             except Exception as e:
@@ -912,6 +932,7 @@ Assistant: {% endif %}"""
         content: dict[str, Any],
         request: ChatCompletionRequest,
         finish_reason_type: str | None,
+        tool_emitted: dict[int, bool] | None = None,
     ):
         """Process tool calls in streaming response"""
         if index not in parser_dict:
@@ -922,6 +943,9 @@ Assistant: {% endif %}"""
         parser = parser_dict[index]
 
         normal_text, calls = parser.parse_stream_chunk(delta)
+
+        if calls and tool_emitted is not None:
+            tool_emitted[index] = True
 
         # Yield normal text
         if normal_text:
@@ -956,16 +980,26 @@ Assistant: {% endif %}"""
                 if isinstance(call_item.parameters, str):
                     latest_delta_len = len(call_item.parameters)
 
+                # Index detector state by the TOOL index of the item being
+                # finalized, not the choice index. With multiple parallel tool
+                # calls the choice index points at the wrong tool and corrupts
+                # the remaining-arguments computation.
+                tool_index = call_item.tool_index
+                if tool_index is None or tool_index < 0 or tool_index >= len(
+                    parser.detector.prev_tool_call_arr
+                ):
+                    continue
                 expected_call = json.dumps(
-                    parser.detector.prev_tool_call_arr[index].get("arguments", {}),
+                    parser.detector.prev_tool_call_arr[tool_index].get("arguments", {}),
                     ensure_ascii=False,
                 )
-                actual_call = parser.detector.streamed_args_for_tool[index]
+                actual_call = parser.detector.streamed_args_for_tool[tool_index]
                 if latest_delta_len > 0:
                     actual_call = actual_call[:-latest_delta_len]
                 remaining_call = expected_call.replace(actual_call, "", 1)
                 call_item.parameters = remaining_call
-                finish_reason_type = "tool_calls"
+                # finish_reason="tool_calls" is reported on the final stream
+                # chunk (see tool_emitted in _generate_chat_stream).
 
             tool_call = ToolCall(
                 id=tool_call_id,
@@ -979,11 +1013,9 @@ Assistant: {% endif %}"""
             choice_data = ChatCompletionResponseStreamChoice(
                 index=index,
                 delta=DeltaMessage(tool_calls=[tool_call]),
-                finish_reason=(
-                    None
-                    if request.stream_options and request.stream_options.include_usage
-                    else finish_reason_type
-                ),
+                # finish_reason is carried by the final chunk of the stream,
+                # not by intermediate tool-call chunks (OpenAI protocol).
+                finish_reason=None,
             )
             chunk = ChatCompletionStreamResponse(
                 id=content["meta_info"]["id"],

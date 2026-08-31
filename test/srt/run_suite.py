@@ -433,6 +433,10 @@ suites = {
         TestFile("test/srt/openai_server/basic/test_serving_chat.py", 0.1),
         TestFile("test/srt/openai_server/basic/test_serving_completions.py", 0.1),
         TestFile("test/srt/test_reasoning_parser.py", 0.1),
+        TestFile(
+            "test/srt/openai_server/basic/test_serving_chat_tool_stream.py", 0.1
+        ),
+        TestFile("test/srt/constrained/test_bitmask_default_allow.py", 0.1),
         TestFile("test/srt/eval/test_simple_eval_common.py", 0.1, runner="pytest"),
         TestFile("test/srt/test_server_info.py", 0.1),
         TestFile("test/srt/test_recurrent_cow_metadata.py", 0.2),

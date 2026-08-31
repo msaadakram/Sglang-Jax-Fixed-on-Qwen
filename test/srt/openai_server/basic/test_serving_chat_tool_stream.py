@@ -1,0 +1,580 @@
+"""Regression tests for Qwen3.8 thinking + tool calling over /v1/chat/completions.
+
+Exercises OpenAIServingChat directly with a mocked TokenizerManager, covering
+the interaction of:
+
+  * reasoning-parser ``qwen3`` (thinking ON / OFF)
+  * tool-call-parser ``qwen3_coder``
+  * stream=False and stream=True
+
+Upstream references:
+  * sgl-project/sglang#36537 - thinking + qwen3_coder must still emit
+    structured tool_calls (and must not loop on token id 0).
+  * sgl-project/sglang#29441 - no standalone empty-content SSE chunk before
+    tool-call chunks (breaks AI SDK / OpenCode style consumers).
+  * sgl-project/sglang#5661 - tool_calls[0].index must be numeric (0-based),
+    never null.
+
+Run with:
+    python -m pytest test/srt/openai_server/basic/test_serving_chat_tool_stream.py
+"""
+
+import asyncio
+import json
+import re
+import time
+import unittest
+import uuid
+from unittest.mock import Mock
+
+from sgl_jax.srt.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
+    StreamOptions,
+)
+from sgl_jax.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+from sgl_jax.srt.function_call.function_call_parser import FunctionCallParser
+from sgl_jax.srt.reasoning_parser import ReasoningParser
+from sgl_jax.test.tool_parser_test_config import ToolParserTestConfig as C
+
+
+THINK_BLOCK = "<think>\nI should call the weather tool for Tokyo.\n</think>\n\n"
+
+
+def tool_call_xml(name: str, params: dict) -> str:
+    """Render the Qwen3-Coder native tool-call block."""
+    out = f"<tool_call>\n<function={name}>\n"
+    for key, value in params.items():
+        out += f"<parameter={key}>\n{value}\n</parameter>\n"
+    out += "</function>\n</tool_call>"
+    return out
+
+
+def get_weather_tool() -> object:
+    return C.make_tool("get_weather", {"city": {"type": "string"}})
+
+
+def get_time_tool() -> object:
+    return C.make_tool("get_time", {"timezone": {"type": "string"}})
+
+
+def search_tool() -> object:
+    return C.make_tool("web_search", {"query": {"type": "string"}})
+
+
+_TAG_RE = re.compile(
+    r"(<think>|</think>|<tool_call>|</tool_call>|<function=|</function>|<parameter=|</parameter>|>)"
+)
+
+
+def _split(text: str, size: int = 4) -> list[str]:
+    """Split like a detokenizer would: special tags arrive atomically as
+    single tokens, plain text arrives in small multi-char pieces."""
+    pieces = []
+    for part in _TAG_RE.split(text):
+        if not part:
+            continue
+        if _TAG_RE.fullmatch(part):
+            pieces.append(part)
+        else:
+            pieces.extend(part[i : i + size] for i in range(0, len(part), size))
+    return pieces
+
+
+class _MockTokenizerManager:
+    def __init__(self, stream_text: str):
+        self.model_config = Mock(is_multimodal=False)
+        self.server_args = Mock(
+            reasoning_parser="qwen3",
+            tool_call_parser="qwen3_coder",
+            enable_cache_report=False,
+        )
+        rid = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+
+        async def _generate(adapted_request, raw_request=None):
+            cumulative = ""
+            pieces = _split(stream_text)
+            for i, piece in enumerate(pieces):
+                cumulative += piece
+                last = i == len(pieces) - 1
+                yield {
+                    "index": 0,
+                    "text": cumulative,
+                    "meta_info": {
+                        "id": rid,
+                        "prompt_tokens": 32,
+                        "completion_tokens": i + 1,
+                        "cached_tokens": 0,
+                        "finish_reason": (
+                            {"type": "stop", "matched": None} if last else None
+                        ),
+                    },
+                }
+
+        self.generate_request = _generate
+
+
+def _make_chat(stream_text: str) -> OpenAIServingChat:
+    return OpenAIServingChat(_MockTokenizerManager(stream_text), Mock())
+
+
+def _request(stream: bool, thinking: bool, tools=None) -> ChatCompletionRequest:
+    return ChatCompletionRequest(
+        model="qwen3.8-27b",
+        messages=[{"role": "user", "content": "What is the weather in Tokyo?"}],
+        tools=tools,
+        stream=stream,
+        chat_template_kwargs={"enable_thinking": thinking},
+    )
+
+
+def _collect_sse(chat: OpenAIServingChat, request: ChatCompletionRequest) -> list:
+    async def _run():
+        out = []
+        async for chunk in chat._generate_chat_stream(Mock(), request, Mock()):
+            out.append(chunk)
+        return out
+
+    raw = asyncio.run(_run())
+    parsed = []
+    for line in raw:
+        assert line.startswith("data: "), f"bad SSE line: {line!r}"
+        body = line[len("data: ") :].strip()
+        if body == "[DONE]":
+            parsed.append("[DONE]")
+        else:
+            parsed.append(json.loads(body))
+    return parsed
+
+
+def _assert_no_empty_content_chunk(chunks: list):
+    """sglang#29441: never emit a standalone chunk with content=='' that has
+    neither a role (first chunk) nor tool_calls."""
+    for chunk in chunks:
+        if chunk == "[DONE]":
+            continue
+        delta = chunk["choices"][0]["delta"]
+        if delta.get("content") == "":
+            assert delta.get("role") or delta.get("tool_calls"), (
+                "empty-content SSE chunk without role/tool_calls breaks "
+                "AI SDK style consumers: "
+                + json.dumps(chunk)
+            )
+
+
+def _assert_valid_tool_stream(chunks: list, expected_names: list[str]):
+    """Validate an OpenAI-compatible streamed tool-call response."""
+    _assert_no_empty_content_chunk(chunks)
+    assert chunks[-1] == "[DONE]", "stream must terminate with data: [DONE]"
+
+    args_by_index: dict[int, str] = {}
+    id_by_index: dict[int, str] = {}
+    finish_reasons = [c for c in chunks if c != "[DONE]" and c["choices"][0]["finish_reason"]]
+    assert finish_reasons, "stream never carried a finish_reason"
+    final_finish = finish_reasons[-1]["choices"][0]["finish_reason"]
+    assert final_finish == "tool_calls", (
+        f"final finish_reason must be 'tool_calls' when tool calls were "
+        f"streamed, got {final_finish!r}"
+    )
+
+    for chunk in chunks:
+        if chunk == "[DONE]":
+            continue
+        delta = chunk["choices"][0]["delta"]
+        for tc in delta.get("tool_calls") or []:
+            idx = tc["index"]
+            assert isinstance(idx, int), f"tool call index must be int, got {idx!r}"
+            if tc.get("id"):
+                if idx in id_by_index:
+                    assert id_by_index[idx] == tc["id"], "tool call id must stay stable"
+                id_by_index[idx] = tc["id"]
+                assert tc["id"].startswith("call_")
+            if tc["function"].get("name"):
+                assert tc["function"]["name"] in expected_names
+            frag = tc["function"].get("arguments") or ""
+            args_by_index[idx] = args_by_index.get(idx, "") + frag
+
+    assert sorted(id_by_index) == list(range(len(expected_names))), (
+        f"expected indexes 0..{len(expected_names) - 1}, got {sorted(id_by_index)}"
+    )
+    for idx, name in enumerate(expected_names):
+        args = json.loads(args_by_index[idx])  # accumulated fragments must be valid JSON
+        assert isinstance(args, dict)
+    return args_by_index
+
+
+class TestNonStreamingToolCalls(unittest.TestCase):
+    def _respond(self, text: str, thinking: bool):
+        chat = _make_chat(text)
+        request = _request(stream=False, thinking=thinking, tools=[get_weather_tool()])
+        ret = {
+            "index": 0,
+            "text": text,
+            "meta_info": {
+                "id": "chatcmpl-test",
+                "prompt_tokens": 32,
+                "completion_tokens": 48,
+                "cached_tokens": 0,
+                "finish_reason": {"type": "stop", "matched": None},
+            },
+        }
+        return chat._build_chat_response(request, [ret], int(time.time())), request
+
+    def test_tool_call_thinking_off(self):
+        text = "Sure.\n\n" + tool_call_xml("get_weather", {"city": "Tokyo"})
+        resp, _ = self._respond(text, thinking=False)
+        choice = resp.choices[0]
+        assert choice.finish_reason == "tool_calls"
+        calls = choice.message.tool_calls
+        assert calls and calls[0].index == 0, f"index must be 0, got {calls[0].index!r}"
+        assert calls[0].id.startswith("call_")
+        assert calls[0].type == "function"
+        assert calls[0].function.name == "get_weather"
+        assert json.loads(calls[0].function.arguments) == {"city": "Tokyo"}
+
+    def test_tool_call_thinking_on(self):
+        text = THINK_BLOCK + tool_call_xml("get_weather", {"city": "Tokyo"})
+        resp, _ = self._respond(text, thinking=True)
+        choice = resp.choices[0]
+        assert choice.finish_reason == "tool_calls"
+        assert choice.message.reasoning_content, "thinking content must be preserved"
+        calls = choice.message.tool_calls
+        assert calls and calls[0].index == 0, f"index must be 0, got {calls[0].index!r}"
+        assert json.loads(calls[0].function.arguments) == {"city": "Tokyo"}
+
+    def test_two_parallel_tool_calls_indexes(self):
+        text = (
+            THINK_BLOCK
+            + tool_call_xml("get_weather", {"city": "Tokyo"})
+            + "\n"
+            + tool_call_xml("get_weather", {"city": "Paris"})
+        )
+        resp, _ = self._respond(text, thinking=True)
+        calls = resp.choices[0].message.tool_calls
+        assert len(calls) == 2
+        assert [c.index for c in calls] == [0, 1], (
+            f"indexes must be [0, 1], got {[c.index for c in calls]}"
+        )
+        assert json.loads(calls[0].function.arguments) == {"city": "Tokyo"}
+        assert json.loads(calls[1].function.arguments) == {"city": "Paris"}
+
+
+class TestStreamingToolCalls(unittest.TestCase):
+    def test_tool_stream_thinking_off(self):
+        text = "Sure.\n\n" + tool_call_xml("get_weather", {"city": "Tokyo"})
+        chat = _make_chat(text)
+        chunks = _collect_sse(chat, _request(stream=True, thinking=False, tools=[get_weather_tool()]))
+        args = _assert_valid_tool_stream(chunks, ["get_weather"])
+        assert json.loads(args[0]) == {"city": "Tokyo"}
+
+    def test_tool_stream_thinking_on(self):
+        """THE critical regression: thinking ON + tools ON + streaming ON."""
+        text = THINK_BLOCK + tool_call_xml("get_weather", {"city": "Tokyo"})
+        chat = _make_chat(text)
+        chunks = _collect_sse(chat, _request(stream=True, thinking=True, tools=[get_weather_tool()]))
+        args = _assert_valid_tool_stream(chunks, ["get_weather"])
+        assert json.loads(args[0]) == {"city": "Tokyo"}
+
+        # reasoning content must have been streamed
+        reasoning = "".join(
+            c["choices"][0]["delta"].get("reasoning_content") or ""
+            for c in chunks
+            if c != "[DONE]"
+        )
+        assert "Tokyo" in reasoning or "weather" in reasoning
+
+    def test_two_parallel_tool_stream_thinking_on(self):
+        text = (
+            THINK_BLOCK
+            + tool_call_xml("get_weather", {"city": "Tokyo"})
+            + "\n"
+            + tool_call_xml("get_time", {"timezone": "JST"})
+        )
+        chat = _make_chat(text)
+        chunks = _collect_sse(
+            chat,
+            _request(stream=True, thinking=True, tools=[get_weather_tool(), get_time_tool()]),
+        )
+        args = _assert_valid_tool_stream(chunks, ["get_weather", "get_time"])
+        assert json.loads(args[0]) == {"city": "Tokyo"}
+        assert json.loads(args[1]) == {"timezone": "JST"}
+
+    def test_three_parallel_tool_stream_thinking_on(self):
+        text = (
+            THINK_BLOCK
+            + tool_call_xml("get_weather", {"city": "Tokyo"})
+            + "\n"
+            + tool_call_xml("get_time", {"timezone": "JST"})
+            + "\n"
+            + tool_call_xml("web_search", {"query": "tokyo weather"})
+        )
+        chat = _make_chat(text)
+        chunks = _collect_sse(
+            chat,
+            _request(
+                stream=True,
+                thinking=True,
+                tools=[get_weather_tool(), get_time_tool(), search_tool()],
+            ),
+        )
+        args = _assert_valid_tool_stream(chunks, ["get_weather", "get_time", "web_search"])
+        assert json.loads(args[2]) == {"query": "tokyo weather"}
+
+
+class TestStreamingTextOnly(unittest.TestCase):
+    def test_reasoning_stream_no_tools(self):
+        text = THINK_BLOCK + "The weather in Tokyo is sunny."
+        chat = _make_chat(text)
+        chunks = _collect_sse(chat, _request(stream=True, thinking=True, tools=None))
+        _assert_no_empty_content_chunk(chunks)
+        assert chunks[-1] == "[DONE]"
+        reasoning = "".join(
+            c["choices"][0]["delta"].get("reasoning_content") or ""
+            for c in chunks
+            if c != "[DONE]"
+        )
+        content = "".join(
+            c["choices"][0]["delta"].get("content") or "" for c in chunks if c != "[DONE]"
+        )
+        assert "sunny" in content
+        assert "I should call" in reasoning
+        final = [c for c in chunks if c != "[DONE]" and c["choices"][0]["finish_reason"]][-1]
+        assert final["choices"][0]["finish_reason"] == "stop"
+
+
+class TestParserPipelineIncremental(unittest.TestCase):
+    """Reasoning parser -> tool detector handoff, chunk by chunk."""
+
+    def _run_pipeline(self, text: str, tools, thinking: bool = True):
+        reasoning = ReasoningParser("qwen3", stream_reasoning=True) if thinking else None
+        fc = FunctionCallParser(tools, "qwen3_coder")
+        calls = []
+        normal = ""
+        for piece in _split(text, 4):
+            _, delta = reasoning.parse_stream_chunk(piece) if reasoning else (None, piece)
+            if delta:
+                n, new_calls = fc.parse_stream_chunk(delta)
+                normal += n
+                calls.extend(new_calls)
+        return normal, calls, fc.detector
+
+    def test_thinking_then_tool_call(self):
+        text = THINK_BLOCK + tool_call_xml("get_weather", {"city": "Tokyo"})
+        normal, calls, det = self._run_pipeline(text, [get_weather_tool()])
+        assert det.current_tool_id == 1  # one tool completed
+        assert calls[0].name == "get_weather"
+        assert calls[0].tool_index == 0
+        streamed = det.streamed_args_for_tool[0]
+        assert json.loads(streamed) == {"city": "Tokyo"}
+
+    def test_reasoning_end_token_split_across_chunks(self):
+        """A </think> tag split across streaming increments must not leak into
+        the reasoning stream nor lose the post-think tool call."""
+        text = THINK_BLOCK + tool_call_xml("get_weather", {"city": "Tokyo"})
+        reasoning = ReasoningParser("qwen3", stream_reasoning=True)
+        leaked = ""
+        normal = ""
+        pieces = []
+        for piece in _split(text, 3):
+            if piece == "</think>":
+                pieces.extend(["</thi", "nk>"])
+            else:
+                pieces.append(piece)
+        for piece in pieces:
+            r, n = reasoning.parse_stream_chunk(piece)
+            leaked += r or ""
+            normal += n or ""
+        assert "</thi" not in leaked and "</think" not in leaked, (
+            f"partial end tag leaked into reasoning stream: {leaked[-60:]!r}"
+        )
+        assert normal.lstrip().startswith("<tool_call>"), f"post-think text lost: {normal!r}"
+
+    def test_large_string_argument_fragments(self):
+        big = "x" * 8192
+        text = tool_call_xml("get_weather", {"city": big})
+        _, calls, det = self._run_pipeline(text, [get_weather_tool()], thinking=False)
+        assert json.loads(det.streamed_args_for_tool[0]) == {"city": big}
+        # incremental: the argument fragment must be emitted before the
+        # closing </tool_call> is consumed, not only at finalization
+        assert any(c.parameters for c in calls)
+
+    def test_unicode_and_escapes(self):
+        value = 'He said "hello" \\n 東京'
+        text = tool_call_xml("get_weather", {"city": value})
+        _, _, det = self._run_pipeline(text, [get_weather_tool()], thinking=False)
+        assert json.loads(det.streamed_args_for_tool[0]) == {"city": value}
+
+    def test_nested_json_parameter(self):
+        nested = '{"lat": 35.6, "lon": 139.7, "tags": ["a", "b"]}'
+        text = tool_call_xml("get_weather", {"city": nested})
+        _, _, det = self._run_pipeline(text, [get_weather_tool()], thinking=False)
+        args = json.loads(det.streamed_args_for_tool[0])
+        assert args["city"] == {"lat": 35.6, "lon": 139.7, "tags": ["a", "b"]}
+
+
+
+NEWLINE = chr(10)
+
+
+class _QwenStyleTokenizer:
+    """Renders messages following the Qwen3 native tool-call protocol
+    (the same structure the official Qwen3 jinja template produces)."""
+
+    bos_token_id = 1
+    chat_template = "qwen3-native"  # non-None so the jinja path is taken
+
+    def apply_chat_template(
+        self, messages, tokenize=True, add_generation_prompt=True, tools=None, **kwargs
+    ):
+        del tokenize, tools
+        im_start = "<|im_start|>"
+        im_end = "<|im_end|>"
+        out = ""
+        for m in messages:
+            role = m["role"]
+            if role == "system":
+                out += im_start + "system" + NEWLINE + m["content"] + im_end + NEWLINE
+            elif role == "user":
+                out += im_start + "user" + NEWLINE + m["content"] + im_end + NEWLINE
+            elif role == "assistant":
+                content = m.get("content") or ""
+                block = ""
+                for tc in m.get("tool_calls") or []:
+                    fn = tc["function"]
+                    block += (
+                        "<tool_call>" + NEWLINE
+                        + json.dumps({"name": fn["name"], "arguments": fn["arguments"]})
+                        + NEWLINE + "</tool_call>" + NEWLINE
+                    )
+                out += im_start + "assistant" + NEWLINE + content + block + im_end + NEWLINE
+            elif role == "tool":
+                out += (
+                    im_start + "user" + NEWLINE + "<tool_response>" + NEWLINE
+                    + m["content"] + NEWLINE + "</tool_response>" + im_end + NEWLINE
+                )
+        if add_generation_prompt:
+            out += im_start + "assistant" + NEWLINE
+            if kwargs.get("enable_thinking") is False:
+                out += "<think>" + NEWLINE + NEWLINE + "</think>" + NEWLINE + NEWLINE
+        return out
+
+    def encode(self, text):
+        return [1, 2, 3]
+
+
+class TestMultiTurnToolFlow(unittest.TestCase):
+    """user -> assistant tool_call -> tool result -> assistant final answer,
+    including the two-parallel-tool-calls variant."""
+
+    def _prompt(self, messages):
+        tm = Mock()
+        tm.model_config = Mock(is_multimodal=False)
+        tm.server_args = Mock(
+            reasoning_parser="qwen3",
+            tool_call_parser="qwen3_coder",
+            enable_cache_report=False,
+        )
+        tm.tokenizer = _QwenStyleTokenizer()
+        tm.mm_processor = None
+        chat = OpenAIServingChat(tm, Mock())
+        chat.template_manager.chat_template_name = None
+        chat.template_manager.jinja_template_content_format = None
+        request = ChatCompletionRequest(
+            model="qwen3.8-27b",
+            messages=messages,
+            tools=[get_weather_tool()],
+            stream=False,
+            chat_template_kwargs={"enable_thinking": True},
+        )
+        adapted, _ = chat._convert_to_internal_request(request)
+        return adapted.text
+
+    def test_single_tool_multi_turn(self):
+        prompt = self._prompt(
+            [
+                {"role": "user", "content": "Weather in Tokyo?"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_abc",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": json.dumps({"city": "Tokyo"}),
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "content": "22C, sunny", "tool_call_id": "call_abc"},
+                {"role": "user", "content": "Summarize that."},
+            ]
+        )
+        expected_call = (
+            "<tool_call>" + NEWLINE
+            + json.dumps({"name": "get_weather", "arguments": {"city": "Tokyo"}})
+            + NEWLINE + "</tool_call>"
+        )
+        assert expected_call in prompt
+        assert "<tool_response>" + NEWLINE + "22C, sunny" in prompt
+        assert "<|im_start|>user" + NEWLINE + "Summarize that." in prompt
+        assert prompt.endswith("<|im_start|>assistant" + NEWLINE)
+
+    def test_two_parallel_tools_multi_turn(self):
+        prompt = self._prompt(
+            [
+                {"role": "user", "content": "Weather in Tokyo and Osaka?"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_a",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": json.dumps({"city": "Tokyo"}),
+                            },
+                        },
+                        {
+                            "id": "call_b",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": json.dumps({"city": "Osaka"}),
+                            },
+                        },
+                    ],
+                },
+                {"role": "tool", "content": "22C sunny", "tool_call_id": "call_a"},
+                {"role": "tool", "content": "18C cloudy", "tool_call_id": "call_b"},
+                {"role": "user", "content": "Compare them."},
+            ]
+        )
+        assert '"city": "Tokyo"' in prompt and '"city": "Osaka"' in prompt
+        assert "22C sunny" in prompt and "18C cloudy" in prompt
+        assert prompt.count("<tool_response>") == 2
+        assert prompt.endswith("<|im_start|>assistant" + NEWLINE)
+
+
+class TestStreamOptionsUsage(unittest.TestCase):
+    def test_include_usage_stream(self):
+        text = THINK_BLOCK + tool_call_xml("get_weather", {"city": "Tokyo"})
+        chat = _make_chat(text)
+        request = _request(stream=True, thinking=True, tools=[get_weather_tool()])
+        request.stream_options = StreamOptions(include_usage=True)
+        chunks = _collect_sse(chat, request)
+        assert chunks[-1] == "[DONE]"
+        usage = [c for c in chunks if c != "[DONE]" and c.get("usage")]
+        assert usage, "usage chunk missing"
+        assert usage[-1]["choices"] == []  # OpenAI spec: usage chunk has no choices
+        finishes = [
+            c["choices"][0]["finish_reason"]
+            for c in chunks
+            if c != "[DONE]" and c["choices"] and c["choices"][0]["finish_reason"]
+        ]
+        assert finishes[-1] == "tool_calls"
+
+
+if __name__ == "__main__":
+    unittest.main()

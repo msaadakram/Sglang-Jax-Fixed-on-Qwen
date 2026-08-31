@@ -9,6 +9,16 @@ from llguidance import LLInterpreter
 def allocate_token_bitmask(batch_size: int, vocab_size: int) -> np.ndarray:
     """Allocate a token bitmask array.
 
+    The buffer is initialized to ALL-BITS-SET (int32 -1): the mask is bit
+    packed and in llguidance's convention a set bit means "token allowed", so
+    a row that is allocated but never filled must allow every token (i.e. be
+    unconstrained). Rows are left unfilled when a grammar errored or finished
+    mid-request, or when a request without a grammar is batched next to
+    constrained requests. Initializing to zeros would mask the entire
+    vocabulary for those rows; with every logit set to -inf, greedy sampling
+    deterministically selects token id 0, producing the well-known
+    token-id-0 repetition loop (ref: sgl-project/sglang#36537).
+
     Args:
         batch_size: Batch size
         vocab_size: Vocabulary size
@@ -17,7 +27,7 @@ def allocate_token_bitmask(batch_size: int, vocab_size: int) -> np.ndarray:
         Numpy array of shape [batch_size, vocab_size // 32] with dtype int32
     """
     num_int32_per_vocab = (vocab_size + 31) // 32
-    return np.zeros((batch_size, num_int32_per_vocab), dtype=np.int32)
+    return np.full((batch_size, num_int32_per_vocab), -1, dtype=np.int32)
 
 
 def fill_token_bitmask(

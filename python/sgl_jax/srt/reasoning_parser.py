@@ -26,6 +26,20 @@ class BaseReasoningFormatDetector:
         self._buffer = ""
         self.stripped_think_start = False
 
+    def _partial_tag_suffix(self, text: str) -> str:
+        """Return the longest proper suffix of ``text`` that is a prefix of a
+        control token (think end / tool start). Keeping such a suffix in the
+        buffer prevents a split tag from being streamed as reasoning text."""
+        candidates = [self.think_end_token]
+        if self.tool_start_token:
+            candidates.append(self.tool_start_token)
+        for token in candidates:
+            max_k = min(len(token) - 1, len(text))
+            for k in range(max_k, 0, -1):
+                if text.endswith(token[:k]):
+                    return text[-k:]
+        return ""
+
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         """
         One-time parsing: Detects and parses reasoning sections in the provided text.
@@ -109,9 +123,14 @@ class BaseReasoningFormatDetector:
                 self._in_reasoning = False
                 return StreamingParseResult(normal_text=normal_text, reasoning_text=reasoning_text)
             if self.stream_reasoning:
-                # Stream the content immediately
-                self._buffer = ""
-                return StreamingParseResult(reasoning_text=current_text)
+                # Stream the content immediately, but hold back a trailing
+                # partial think-end / tool-start token so that a tag split
+                # across two increments is neither leaked into the reasoning
+                # stream nor lost (it stays buffered until it completes).
+                holdback = self._partial_tag_suffix(current_text)
+                emitted = current_text[: len(current_text) - len(holdback)]
+                self._buffer = holdback
+                return StreamingParseResult(reasoning_text=emitted)
             else:
                 return StreamingParseResult()
 
@@ -171,6 +190,11 @@ class Qwen3Detector(BaseReasoningFormatDetector):
             "</think>",
             force_reasoning=True,
             stream_reasoning=stream_reasoning,
+            # Qwen3-Coder style models may emit the native <tool_call> block
+            # without a closing </think> (e.g. truncated reasoning). Exit
+            # reasoning at <tool_call> so the tool-call parser receives the
+            # block instead of it being swallowed as reasoning content.
+            tool_start_token="<tool_call>",
         )
 
 
