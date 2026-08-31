@@ -22,6 +22,7 @@ Run with:
 import asyncio
 import json
 import re
+import sys
 import time
 import unittest
 import uuid
@@ -30,6 +31,8 @@ from unittest.mock import Mock
 from sgl_jax.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     StreamOptions,
+    Tool,
+    Function,
     ToolChoice,
     ToolChoiceFuncName,
 )
@@ -866,6 +869,195 @@ class TestForcedToolChoice(unittest.TestCase):
             if ch["finish_reason"]:
                 finish = ch["finish_reason"]
         self.assertEqual(json.loads(args[0]), {"city": "Tokyo"})
+        self.assertEqual(finish, "tool_calls")
+        self.assertTrue(done)
+
+
+NEWLINE = chr(10)
+
+
+class TestNestedArgumentStreaming(unittest.TestCase):
+    """Nested/complex JSON tool-call arguments must stream correctly.
+
+    Root cause of the reported failure (name-only tool_calls with
+    arguments=\"\"): the incremental detector only streamed arguments from
+    COMPLETE <parameter>...</parameter> blocks. When the model leaves the
+    block unterminated at </tool_call> (or omits the <parameter> wrapper
+    entirely), everything after the function name was dropped. The
+    non-streaming path was unaffected because its regex falls back to
+    capturing to end-of-text.
+
+    The detector now flushes pending parameter content at tool-call end and
+    conforms emitted keys to the tool schema (models may flatten nested
+    object parameters into top-level blocks).
+    """
+
+    @staticmethod
+    def _tool(name, props, required=None):
+        return Tool(type="function", function=Function(
+            name=name, description=name,
+            parameters={"type": "object", "properties": props,
+                        "required": required or list(props)},
+        ))
+
+    EVENT_TOOL = Tool(type="function", function=Function(
+        name="create_event", description="Create an event",
+        parameters={"type": "object", "properties": {"event": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "location": {"type": "string"},
+                "attendees": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["title", "location", "attendees"],
+        }}, "required": ["event"]},
+    ))
+
+    @classmethod
+    def _call_xml(cls, body):
+        return (THINK_BLOCK + "<tool_call>" + NEWLINE
+                + "<function=create_event>" + NEWLINE + body + NEWLINE + "</tool_call>")
+
+    def _stream_args(self, text, tools, chunk_size=6):
+        T = sys.modules[__name__]
+        orig = T._split
+        T._split = lambda t, size=9999: [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+        try:
+            chat = T._make_chat(text)
+            request = T._request(stream=True, thinking=True, tools=tools)
+            chunks = T._collect_sse(chat, request)
+        finally:
+            T._split = orig
+        args, finish, done = {}, None, False
+        for c in chunks:
+            if c == "[DONE]":
+                done = True
+                continue
+            ch = c["choices"][0]
+            for t in ch["delta"].get("tool_calls") or []:
+                i = t["index"]
+                args[i] = args.get(i, "") + (t["function"].get("arguments") or "")
+            if ch["finish_reason"]:
+                finish = ch["finish_reason"]
+        return args, finish, done
+
+    def _assert_stream(self, body, expected, tools=None, chunk_sizes=(6, 1)):
+        tools = tools or [self.EVENT_TOOL]
+        text = self._call_xml(body)
+        for cs in chunk_sizes:
+            with self.subTest(chunk=cs):
+                args, finish, done = self._stream_args(text, tools, cs)
+                self.assertEqual(json.loads(args[0]), expected)
+                self.assertEqual(finish, "tool_calls")
+                self.assertTrue(done)
+
+    def test_1_flat_object(self):
+        self._assert_stream(
+            "<parameter=city>" + NEWLINE + "Tokyo" + NEWLINE + "</parameter>",
+            {"city": "Tokyo"},
+            tools=[Tool(type="function", function=Function(name="create_event", description="d",
+                  parameters={"type": "object", "properties": {"city": {"type": "string"}},
+                  "required": ["city"]}))],
+        )
+
+    def test_2_nested_object(self):
+        self._assert_stream(
+            "<parameter=event>" + NEWLINE + json.dumps({"title": "Team Meeting"}) + NEWLINE + "</parameter>",
+            {"event": {"title": "Team Meeting"}},
+        )
+
+    def test_3_nested_object_with_array(self):
+        ev = {"title": "Team Meeting", "location": "Lahore", "attendees": ["Ali", "Sara"]}
+        self._assert_stream(
+            "<parameter=event>" + NEWLINE + json.dumps(ev) + NEWLINE + "</parameter>",
+            {"event": ev},
+        )
+
+    def test_4_deep_nesting_three_levels(self):
+        expected = {"event": {"title": "M", "meta": {"tags": ["a", {"c": 1}]}}}
+        self._assert_stream(
+            "<parameter=event>" + NEWLINE + json.dumps(expected["event"]) + NEWLINE + "</parameter>",
+            expected,
+        )
+
+    def test_5_strings_with_quotes_escapes_newlines_unicode(self):
+        value = {"title": 'He said "hi" \\n 東京', "location": "Lahore", "attendees": ["Ali"]}
+        self._assert_stream(
+            "<parameter=event>" + NEWLINE + json.dumps(value) + NEWLINE + "</parameter>",
+            {"event": value},
+        )
+
+    def test_6_long_nested_string(self):
+        value = {"title": "x" * 8192, "location": "Lahore", "attendees": ["Ali"]}
+        self._assert_stream(
+            "<parameter=event>" + NEWLINE + json.dumps(value) + NEWLINE + "</parameter>",
+            {"event": value},
+        )
+
+    def test_7_multiple_params_different_depths(self):
+        tools = [self._tool("create_event", {
+            "event": {"type": "object", "properties": {"title": {"type": "string"}},
+                      "required": ["title"]},
+            "organizer": {"type": "string"},
+            "tags": {"type": "array", "items": {"type": "string"}},
+        })]
+        expected = {"event": {"title": "M"}, "organizer": "Ali", "tags": ["a", "b"]}
+        self._assert_stream(
+            "<parameter=event>" + NEWLINE + json.dumps({"title": "M"}) + NEWLINE + "</parameter>" + NEWLINE
+            + "<parameter=organizer>" + NEWLINE + "Ali" + NEWLINE + "</parameter>" + NEWLINE
+            + "<parameter=tags>" + NEWLINE + json.dumps(["a", "b"]) + NEWLINE + "</parameter>",
+            expected, tools=tools,
+        )
+
+    def test_8_unterminated_parameter_block(self):
+        """The reported failure: </parameter> never arrives before the tool
+        call ends -> args were \"\" (invalid JSON)."""
+        ev = {"title": "Team Meeting", "location": "Lahore", "attendees": ["Ali", "Sara"]}
+        self._assert_stream(
+            "<parameter=event>" + NEWLINE + json.dumps(ev),
+            {"event": ev},
+        )
+
+    def test_9_bare_json_body_without_parameter_wrapper(self):
+        ev = {"title": "Team Meeting", "location": "Lahore", "attendees": ["Ali", "Sara"]}
+        self._assert_stream(json.dumps({"event": ev}), {"event": ev})
+
+    def test_10_flattened_body_conforms_to_schema(self):
+        """Model flattens the nested object into top-level keys; the schema
+        conformance wraps them under the single object parameter."""
+        ev = {"title": "Team Meeting", "location": "Lahore", "attendees": ["Ali", "Sara"]}
+        self._assert_stream(json.dumps(ev), {"event": ev})
+
+    def test_11_nested_non_stream_matches_stream(self):
+        ev = {"title": "Team Meeting", "location": "Lahore", "attendees": ["Ali", "Sara"]}
+        text = self._call_xml("<parameter=event>" + NEWLINE + json.dumps(ev) + NEWLINE + "</parameter>")
+        T = sys.modules[__name__]
+        chat = T._make_chat(text)
+        request = T._request(stream=False, thinking=True, tools=[self.EVENT_TOOL])
+        ret = {"index": 0, "text": text, "meta_info": {
+            "id": "c", "prompt_tokens": 8, "completion_tokens": 16, "cached_tokens": 0,
+            "finish_reason": {"type": "stop", "matched": None}}}
+        resp = chat._build_chat_response(request, [ret], int(time.time()))
+        call = resp.choices[0].message.tool_calls[0]
+        self.assertEqual(resp.choices[0].finish_reason, "tool_calls")
+        self.assertEqual(call.index, 0)
+        self.assertEqual(json.loads(call.function.arguments), {"event": ev})
+
+    def test_12_multiple_nested_tool_calls_stream(self):
+        second = self._tool("create_reminder", {
+            "reminder": {"type": "object", "properties": {"note": {"type": "string"}},
+                         "required": ["note"]},
+        })
+        text = (THINK_BLOCK
+                + "<tool_call>" + NEWLINE + "<function=create_event>" + NEWLINE
+                + "<parameter=event>" + NEWLINE + json.dumps({"title": "M"}) + NEWLINE
+                + "</parameter>" + NEWLINE + "</function>" + NEWLINE + "</tool_call>" + NEWLINE
+                + "<tool_call>" + NEWLINE + "<function=create_reminder>" + NEWLINE
+                + "<parameter=reminder>" + NEWLINE + json.dumps({"note": "prep"}) + NEWLINE
+                + "</parameter>" + NEWLINE + "</function>" + NEWLINE + "</tool_call>")
+        args, finish, done = self._stream_args(text, [self.EVENT_TOOL, second], 5)
+        self.assertEqual(json.loads(args[0]), {"event": {"title": "M"}})
+        self.assertEqual(json.loads(args[1]), {"reminder": {"note": "prep"}})
         self.assertEqual(finish, "tool_calls")
         self.assertTrue(done)
 

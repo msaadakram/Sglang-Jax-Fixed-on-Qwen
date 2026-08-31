@@ -271,33 +271,6 @@ class FunctionCallParser:
             },
         )
 
-    @staticmethod
-    def _compose_thinking_prefix(ebnf: str) -> str:
-        """Prepend a required <think>...</think> free-text prefix to a
-        grammar's start rule so a thinking model can reason before emitting
-        the constrained tool-call structure.
-
-        The detector's EBNF is in GBNF style, which llguidance converts to
-        Lark via llguidance.gbnf_to_lark.any_to_lark (the exact conversion
-        dispatch_ebnf performs). The free-text regex must be inserted AFTER
-        that conversion: GBNF conversion rejects inline regexes, while Lark
-        supports them natively. The prefix is required (not optional)
-        because thinking is enabled for these requests and llguidance's
-        mask computation degenerates for optional groups containing
-        free-text loops."""
-        try:
-            from llguidance.gbnf_to_lark import any_to_lark
-        except ImportError:  # pragma: no cover - older llguidance layouts
-            logger.warning("llguidance.gbnf_to_lark unavailable; cannot compose thinking prefix")
-            return ebnf
-        lark = any_to_lark(ebnf)
-        if "start:" not in lark:
-            logger.warning("Converted grammar has no start rule; cannot compose thinking prefix")
-            return ebnf
-        return lark.replace(
-            "start: ", 'start: "<think>" /(.|\\n)*/ "</think>" ', 1
-        )
-
     def get_ebnf(self, tool_choice: ToolChoice | Literal["required"]) -> str | None:
         """
         Get the EBNF grammar for the specified tool choice.

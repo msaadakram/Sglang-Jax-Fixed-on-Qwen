@@ -92,6 +92,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
         # Build tool indices for validation
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
+            self._tools = tools
 
         while True:
             # If we're not in a tool call and don't see a start token, return normal text
@@ -188,6 +189,17 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 if self.tool_call_end_token in self._buf:
                     end_pos = self._buf.find(self.tool_call_end_token)
 
+                    # Flush argument content the incremental parser could not
+                    # stream as a complete <parameter> block: an unterminated
+                    # <parameter=X> (no </parameter> before the tool call end)
+                    # or a bare JSON body without any <parameter> wrapper.
+                    # Without this the client receives name-only tool_calls
+                    # with arguments="". Mirrors the non-streaming regex
+                    # fallback <parameter=(.*)$.
+                    calls.extend(
+                        self._flush_pending_parameters(self._buf[:end_pos])
+                    )
+
                     # Add closing brace to complete the JSON object
                     current_streamed = self.streamed_args_for_tool[self.current_tool_id]
                     if current_streamed:
@@ -216,6 +228,126 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     break
 
         return StreamingParseResult(normal_text=normal, calls=calls)
+
+    def _current_tool_schema(self) -> dict:
+        """JSON-schema properties of the tool call currently being streamed."""
+        name = self._current_function_name
+        for tool in getattr(self, "_tools", []) or []:
+            if tool.function.name == name:
+                return (tool.function.parameters or {}).get("properties", {}) or {}
+        return {}
+
+    def _conform_params_to_schema(self, new_params: dict) -> dict:
+        """Align emitted parameter names with the tool schema.
+
+        Some models flatten nested object parameters into top-level blocks
+        (e.g. emit <parameter=title> for a tool whose only argument is an
+        object parameter `event` with sub-property `title`). When every
+        emitted key is a sub-property of a single object-typed parameter and
+        none matches a top-level property, wrap them under that parameter so
+        the reconstructed arguments match the declared schema."""
+        if not new_params:
+            return new_params
+        props = self._current_tool_schema()
+        if not props or set(new_params.keys()) <= set(props.keys()):
+            return new_params
+        object_params = [
+            key
+            for key, spec in props.items()
+            if isinstance(spec, dict) and spec.get("type") == "object"
+        ]
+        if len(object_params) != 1:
+            return new_params
+        sub_props = (props[object_params[0]].get("properties") or {}) or {}
+        if sub_props and set(new_params.keys()) <= set(sub_props.keys()):
+            return {object_params[0]: new_params}
+        return new_params
+
+    def _emit_parameter_diff(self, new_params: dict) -> list[ToolCallItem]:
+        """Emit the incremental JSON fragment diff for new_params."""
+        calls: list[ToolCallItem] = []
+        if new_params == self._current_parameters:
+            return calls
+
+        if not self._current_parameters:
+            # First parameter(s) - start JSON object but don't close it yet
+            items = []
+            for key, value in new_params.items():
+                items.append(
+                    f"{json.dumps(key, ensure_ascii=False)}: {json.dumps(value, ensure_ascii=False)}"
+                )
+            json_fragment = "{" + ", ".join(items)
+
+            calls.append(
+                ToolCallItem(
+                    tool_index=self.current_tool_id,
+                    name=None,
+                    parameters=json_fragment,
+                )
+            )
+            self.streamed_args_for_tool[self.current_tool_id] = json_fragment
+        else:
+            # Additional parameters - add them incrementally
+            new_keys = set(new_params.keys()) - set(self._current_parameters.keys())
+            if new_keys:
+                continuation_parts = []
+                for key in new_keys:
+                    value = new_params[key]
+                    continuation_parts.append(
+                        f"{json.dumps(key, ensure_ascii=False)}: {json.dumps(value, ensure_ascii=False)}"
+                    )
+
+                json_fragment = ", " + ", ".join(continuation_parts)
+
+                calls.append(
+                    ToolCallItem(
+                        tool_index=self.current_tool_id,
+                        name=None,
+                        parameters=json_fragment,
+                    )
+                )
+                self.streamed_args_for_tool[self.current_tool_id] = (
+                    self.streamed_args_for_tool[self.current_tool_id] + json_fragment
+                )
+
+        self._current_parameters = new_params
+        self.prev_tool_call_arr[self.current_tool_id]["arguments"] = new_params
+        return calls
+
+    def _flush_pending_parameters(self, text_before_end: str) -> list[ToolCallItem]:
+        """Flush argument content that never formed a complete <parameter>
+        block before the tool call ended. Two cases:
+
+        1. an unterminated <parameter=X> block (no </parameter>): the value
+           runs to the end of the text (mirrors the non-streaming regex
+           fallback <parameter=(.*)$);
+        2. a bare JSON body with no <parameter> wrapper at all.
+
+        Without this flush the client receives name-only tool_calls with
+        arguments="" (invalid JSON).
+        """
+        starts = list(re.finditer(r"<parameter=([^>]+)>", text_before_end))
+        if starts:
+            match = starts[-1]
+            tail = text_before_end[match.end() :]
+            if "</parameter>" in tail:
+                return []  # last block is complete; already streamed
+            name = match.group(1).strip()
+            raw = tail
+            raw = re.sub(r"</function>\s*$", "", raw)
+            raw = raw.replace(self.tool_call_end_token, "")
+            new_params = self._conform_params_to_schema({name: _safe_val(raw.strip())})
+            return self._emit_parameter_diff(new_params)
+
+        # Case 2: no <parameter> wrapper at all -> bare JSON body
+        body = text_before_end.strip()
+        if not body:
+            return []
+        parsed = _safe_val(body)
+        if not isinstance(parsed, dict):
+            return []
+        new_params = self._conform_params_to_schema(parsed)
+        return self._emit_parameter_diff(new_params)
 
     def _parse_and_stream_parameters(self, text_to_parse: str) -> list[ToolCallItem]:
         """
