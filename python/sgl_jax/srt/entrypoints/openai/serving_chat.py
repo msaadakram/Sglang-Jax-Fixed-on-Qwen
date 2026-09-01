@@ -976,6 +976,13 @@ Assistant: {% endif %}"""
 
         normal_text, calls = parser.parse_stream_chunk(delta)
 
+        # Generation end: flush any open (unterminated) tool-call parameter
+        # so pending argument fragments are emitted before finish_reason.
+        if finish_reason_type is not None:
+            flush_calls = parser.detector.flush_pending()
+            if flush_calls:
+                calls.extend(flush_calls)
+
         if calls and tool_emitted is not None:
             tool_emitted[index] = True
 

@@ -365,7 +365,7 @@ class TestParserPipelineIncremental(unittest.TestCase):
     def test_thinking_then_tool_call(self):
         text = THINK_BLOCK + tool_call_xml("get_weather", {"city": "Tokyo"})
         normal, calls, det = self._run_pipeline(text, [get_weather_tool()])
-        assert det.current_tool_id == 1  # one tool completed
+        assert det.current_tool_id == 0  # tool 0 is the current (completed) call
         assert calls[0].name == "get_weather"
         assert calls[0].tool_index == 0
         streamed = det.streamed_args_for_tool[0]
@@ -413,7 +413,9 @@ class TestParserPipelineIncremental(unittest.TestCase):
         text = tool_call_xml("get_weather", {"city": nested})
         _, _, det = self._run_pipeline(text, [get_weather_tool()], thinking=False)
         args = json.loads(det.streamed_args_for_tool[0])
-        assert args["city"] == {"lat": 35.6, "lon": 139.7, "tags": ["a", "b"]}
+        # `city` is declared string-typed in the get_weather schema, so the
+        # schema-driven conversion preserves the JSON as a string.
+        assert args["city"] == nested
 
 
 
@@ -1060,6 +1062,81 @@ class TestNestedArgumentStreaming(unittest.TestCase):
         self.assertEqual(json.loads(args[1]), {"reminder": {"note": "prep"}})
         self.assertEqual(finish, "tool_calls")
         self.assertTrue(done)
+
+
+
+class TestNestedTagEmission(unittest.TestCase):
+    """Real Qwen3-Coder-style models emit object parameters as NESTED
+    <parameter> tags. Every variant must reconstruct the full nested
+    arguments (this is the create_event failure class)."""
+
+    NL = chr(10)
+    EV = {"title": "Team Meeting", "location": "Lahore", "attendees": ["Ali", "Sara"]}
+    EXPECTED = {"event": EV}
+
+    @classmethod
+    def _stream_args(cls, text, chunk_size=6):
+        T = sys.modules[__name__]
+        tools = [TestNestedArgumentStreaming.EVENT_TOOL]
+        orig = T._split
+        T._split = lambda t, size=9999: [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+        try:
+            chat = T._make_chat(text)
+            chunks = T._collect_sse(chat, T._request(stream=True, thinking=True, tools=tools))
+        finally:
+            T._split = orig
+        args, finish, done = {}, None, False
+        for c in chunks:
+            if c == "[DONE]":
+                done = True
+                continue
+            ch = c["choices"][0]
+            for t in ch["delta"].get("tool_calls") or []:
+                i = t["index"]
+                args[i] = args.get(i, "") + (t["function"].get("arguments") or "")
+            if ch["finish_reason"]:
+                finish = ch["finish_reason"]
+        return args, finish, done
+
+    def _assert(self, body, expected):
+        text = (THINK_BLOCK + "<tool_call>" + self.NL + "<function=create_event>"
+                + self.NL + body + self.NL + "</tool_call>")
+        for cs in (6, 1):
+            with self.subTest(chunk=cs):
+                args, finish, done = self._stream_args(text, cs)
+                self.assertEqual(json.loads(args[0]), expected)
+                self.assertEqual(finish, "tool_calls")
+                self.assertTrue(done)
+
+    def test_h1_nested_parameter_tags(self):
+        NL = self.NL
+        body = ("<parameter=event>" + NL
+                + "<parameter=title>" + NL + "Team Meeting" + NL + "</parameter>" + NL
+                + "<parameter=location>" + NL + "Lahore" + NL + "</parameter>" + NL
+                + "<parameter=attendees>" + NL + '["Ali", "Sara"]' + NL + "</parameter>" + NL
+                + "</parameter>")
+        self._assert(body, self.EXPECTED)
+
+    def test_h2_nested_tags_outer_unclosed(self):
+        NL = self.NL
+        body = ("<parameter=event>" + NL
+                + "<parameter=title>" + NL + "Team Meeting" + NL + "</parameter>" + NL
+                + "<parameter=location>" + NL + "Lahore" + NL + "</parameter>" + NL
+                + "<parameter=attendees>" + NL + '["Ali", "Sara"]' + NL + "</parameter>")
+        self._assert(body, self.EXPECTED)
+
+    def test_h3_json_value_with_gt_and_braces(self):
+        value = {"title": "a > b", "meta": {"ok": True}, "attendees": ["Ali", "Sara"]}
+        self._assert(
+            "<parameter=event>" + self.NL + json.dumps(value) + self.NL + "</parameter>",
+            {"event": value},
+        )
+
+    def test_h4_parameter_tag_split_across_chunks(self):
+        NL = self.NL
+        body = ("<par" + "ameter=" + "ev" + "ent>" + NL
+                + json.dumps(self.EV) + NL + "</parameter>")
+        self._assert(body, self.EXPECTED)
 
 
 if __name__ == "__main__":
