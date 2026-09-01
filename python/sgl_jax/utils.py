@@ -22,18 +22,44 @@ class TypeBasedDispatcher:
         raise ValueError(f"Invalid object: {obj}")
 
 
-def find_printable_text(text: str) -> str:
-    """Find printable text by removing invalid UTF-8 sequences."""
-    if not text:
-        return text
+def _is_chinese_char(cp: int) -> bool:
+    """Checks whether CP is the codepoint of a CJK character."""
+    # This defines a "chinese character" as anything in the CJK Unicode block:
+    #   https://en.wikipedia.org/wiki/CJK_Unified_Ideographs_(Unicode_block)
+    #
+    # Note that the CJK Unicode block is NOT all Japanese and Korean characters,
+    # despite its name. The modern Korean Hangul alphabet is a different block,
+    # as is Japanese Hiragana and Katakana. Those alphabets are used to write
+    # space-separated words, so they are not treated specially and handled
+    # like the all of the other languages.
+    return (
+        (0x4E00 <= cp <= 0x9FFF)
+        or (0x3400 <= cp <= 0x4DBF)
+        or (0x20000 <= cp <= 0x2A6DF)
+        or (0x2A700 <= cp <= 0x2B73F)
+        or (0x2B740 <= cp <= 0x2B81F)
+        or (0x2B820 <= cp <= 0x2CEAF)
+        or (0xF900 <= cp <= 0xFAFF)
+        or (0x2F800 <= cp <= 0x2FA1F)
+    )
 
-    # Try to encode/decode to clean up any invalid UTF-8 sequences
-    try:
-        # This will replace invalid sequences with the replacement character
-        return text.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
-    except Exception:
-        # Fallback: just return the original text
+
+def find_printable_text(text: str) -> str:
+    """Returns the longest printable substring of text that contains only entire words."""
+    # Borrowed from https://github.com/huggingface/transformers/blob/061580c82c2db1de9139528243e105953793f7a2/src/transformers/generation/streamers.py#L99
+    # After the symbol for a new line, we flush the cache.
+    if text.endswith("\n"):
         return text
+    # If the last token is a CJK character, we print the characters.
+    elif len(text) > 0 and _is_chinese_char(ord(text[-1])):
+        return text
+    # Otherwise if the penultimate token is a CJK character, we print the characters except for the last one.
+    elif len(text) > 1 and _is_chinese_char(ord(text[-2])):
+        return text[:-1]
+    # Otherwise, prints until the last space char (simple heuristic to avoid printing incomplete words,
+    # which may change with the subsequent token -- there are probably smarter ways to do this!)
+    else:
+        return text[: text.rfind(" ") + 1]
 
 
 def get_exception_traceback() -> str:

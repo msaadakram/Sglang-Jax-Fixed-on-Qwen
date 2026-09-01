@@ -46,6 +46,25 @@ class DecodeStatus:
     read_offset: int
     # Offset that's sent to tokenizer for incremental update.
     sent_offset: int = 0
+    # Length of the committed decoded text, tracked incrementally to avoid
+    # repeated len() on a growing string (and to support chunked appends).
+    decoded_text_len: int = dataclasses.field(init=False)
+    # Uncommitted decoded-text chunks; materialized by get_decoded_text().
+    decoded_text_chunks: list[str] = dataclasses.field(default_factory=list)
+
+    def __post_init__(self):
+        self.decoded_text_len = len(self.decoded_text)
+
+    def append_decoded_text(self, text: str):
+        if text:
+            self.decoded_text_chunks.append(text)
+            self.decoded_text_len += len(text)
+
+    def get_decoded_text(self) -> str:
+        if self.decoded_text_chunks:
+            self.decoded_text += "".join(self.decoded_text_chunks)
+            self.decoded_text_chunks.clear()
+        return self.decoded_text
 
 
 class DetokenizerManager:
@@ -234,11 +253,12 @@ class DetokenizerManager:
         output_strs = []
         output_ids_list = []
         for i in range(bs):
+            rid = recv_obj.rids[i]
             try:
-                s = self.decode_status[recv_obj.rids[i]]
+                s = self.decode_status[rid]
             except KeyError as e:
                 raise RuntimeError(
-                    f"Decode status not found for request {recv_obj.rids[i]}. "
+                    f"Decode status not found for request {rid}. "
                     "It may be due to the request being evicted from the decode status due to memory pressure. "
                     "Please increase the maximum number of requests by setting "
                     "the SGLANG_DETOKENIZER_MAX_STATES environment variable to a bigger value than the default value. "
@@ -247,26 +267,44 @@ class DetokenizerManager:
                 ) from e
             new_text = read_texts[i][len(surr_texts[i]) :]
             new_token_ids = read_ids[i][len(surr_ids[i]) :]
-            if recv_obj.finished_reasons[i] is None:
-                # Streaming chunk: update the decode status
-                if len(new_text) > 0 and not new_text.endswith("�"):
-                    s.decoded_text = s.decoded_text + new_text
-                    s.surr_offset = s.read_offset
-                    s.read_offset = len(s.decode_ids)
-                    new_text = ""
-                else:
-                    new_text = find_printable_text(new_text)
-
-            output_str = self.trim_matched_stop(
-                s.decoded_text + new_text,
-                recv_obj.finished_reasons[i],
-                recv_obj.no_stop_trim[i],
-            )
-
             processed_new_token_ids = process_special_tokens_spaces(
                 new_token_ids,
                 recv_obj.skip_special_tokens[i],
                 self.tokenizer.all_special_ids,
+            )
+            if recv_obj.finished_reasons[i] is None:
+                # Streaming. Invariant: sent_offset >= decoded_text_len. The
+                # gap (`pending`) is "printable but uncommitted" text emitted in
+                # a prior incomplete-UTF-8 step; skip it here so we don't
+                # double-send it once the character completes.
+                pending = s.sent_offset - s.decoded_text_len
+                if new_text and not new_text.endswith("�"):
+                    # Clean text: commit to decoded_text and advance offsets.
+                    s.append_decoded_text(new_text)
+                    s.surr_offset = s.read_offset
+                    s.read_offset = len(s.decode_ids)
+                    s.sent_offset = s.decoded_text_len
+                    output_strs.append(new_text[pending:] if pending else new_text)
+                else:
+                    # Incomplete UTF-8 (e.g. a multi-byte char split across
+                    # tokens): emit only the printable prefix and do NOT commit
+                    # or advance the token offsets, so the next iteration
+                    # re-decodes with the continuation token. This avoids
+                    # emitting U+FFFD for a not-yet-complete character.
+                    printable = find_printable_text(new_text)
+                    s.sent_offset = s.decoded_text_len + len(printable)
+                    output_strs.append(printable[pending:] if pending else printable)
+                output_ids_list.append(processed_new_token_ids)
+                continue
+
+            if rid in self.decode_status:
+                del self.decode_status[rid]
+
+            # Finished: materialize once, trim the matched stop, emit the tail.
+            output_str = self.trim_matched_stop(
+                s.get_decoded_text() + new_text,
+                recv_obj.finished_reasons[i],
+                recv_obj.no_stop_trim[i],
             )
 
             # Incrementally send text.
