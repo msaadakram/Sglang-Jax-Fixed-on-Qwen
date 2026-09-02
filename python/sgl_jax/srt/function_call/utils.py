@@ -1,3 +1,6 @@
+import ast
+import threading
+import warnings
 from json import JSONDecodeError, JSONDecoder
 from json.decoder import WHITESPACE
 from typing import Any, Literal
@@ -142,6 +145,58 @@ def get_json_schema_constraint(
         return json_schema
 
     return None
+
+
+# ``warnings.catch_warnings`` mutates the *process-global* warning filters and
+# is therefore not thread-safe (CPython docs). Tool-call parsing runs on the
+# request path and may execute concurrently, so the enter/eval/restore window
+# is serialized. These helpers are microsecond-cheap; the lock has no perf
+# impact. (Backported from upstream sglang function_call/utils.py.)
+_safe_ast_lock = threading.Lock()
+
+
+def _run_ast_quiet(fn, *args):
+    """Run an ``ast`` function with invalid-escape warnings suppressed.
+
+    CPython parses invalid escapes (e.g. ``"\\d+"``) with the backslash kept
+    and only emits a warning, so the parsed value is already correct —
+    promoting the warning to an error would drop otherwise-valid tool calls.
+
+    Holds ``_safe_ast_lock`` because ``catch_warnings`` touches global state."""
+    with _safe_ast_lock, warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=SyntaxWarning)
+        warnings.filterwarnings("ignore", category=DeprecationWarning)
+        return fn(*args)
+
+
+def safe_literal_eval(value: str) -> Any:
+    """``ast.literal_eval`` with invalid-escape warnings suppressed.
+
+    Used as the fallback parameter-value converter when ``json.loads`` fails
+    (e.g. Python-literal-style tool arguments such as ``{'a': 1}`` or regex
+    patterns containing ``\\d``)."""
+    return _run_ast_quiet(ast.literal_eval, value)
+
+
+def get_schema_properties(schema: Any) -> dict[str, Any]:
+    """Top-level ``properties`` of a tool ``parameters`` schema, descending
+    into ``anyOf``/``oneOf``/``allOf`` branches when the top level declares
+    none (legal JSON Schema, e.g. discriminated-union arguments).
+
+    Backported from upstream sglang (commit 0665102ce5)."""
+    if not isinstance(schema, dict):
+        return {}
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        return properties
+    merged: dict[str, Any] = {}
+    for keyword in ("anyOf", "oneOf", "allOf"):
+        branches = schema.get(keyword)
+        if isinstance(branches, list):
+            for branch in branches:
+                for key, value in get_schema_properties(branch).items():
+                    merged.setdefault(key, value)
+    return merged
 
 
 def infer_type_from_json_schema(schema: dict[str, Any]) -> str | None:

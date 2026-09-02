@@ -978,7 +978,10 @@ Assistant: {% endif %}"""
 
         # Generation end: flush any open (unterminated) tool-call parameter
         # so pending argument fragments are emitted before finish_reason.
-        if finish_reason_type is not None:
+        # Aborted requests are excluded: the stream is being torn down and
+        # partial arguments must not be finalized (ref: upstream flush gate
+        # `finish_reason_type != "abort"`).
+        if finish_reason_type is not None and finish_reason_type != "abort":
             flush_calls = parser.detector.flush_pending()
             if flush_calls:
                 calls.extend(flush_calls)

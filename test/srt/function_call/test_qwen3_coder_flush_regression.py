@@ -1,0 +1,491 @@
+"""Regression tests for Qwen3CoderDetector flush/end-of-stream + backported helpers.
+
+Locks in the backport of upstream sglang commits 0665102ce5 / c20c48b8fd
+(nested tool-call arguments truncated in streaming mode):
+
+  * EOS/stop-token arriving mid-<parameter> (unclosed value): flush_pending()
+    must reconstruct the full JSON arguments (the create_event failure class)
+    instead of crashing on `dict.lower` or emitting a shifted/truncated tail.
+  * Buffer-slice offset accounting: an open parameter's value start must stay
+    valid when the streaming buffer is compacted (parsed_pos slice).
+  * Backported utils helpers: safe_literal_eval (invalid-escape warnings
+    suppressed, thread-safe) and get_schema_properties (anyOf/oneOf/allOf
+    descent).
+  * 13 pre-existing behaviors that must not regress: tag emission order,
+    nested parameter tags (h1/h2), JSON values with `>` and braces, tags split
+    across chunks, escaped quotes, unicode, multiple sequential calls,
+    state reset between calls, thinking/tool transitions, bare-JSON bodies,
+    array leaves, anyOf schemas, null handling.
+
+Run with:
+    python test/srt/function_call/test_qwen3_coder_flush_regression.py
+"""
+
+import json
+import threading
+import unittest
+import warnings
+
+from sgl_jax.srt.entrypoints.openai.protocol import Function, Tool
+from sgl_jax.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
+from sgl_jax.srt.function_call.utils import get_schema_properties, safe_literal_eval
+
+NL = "\n"
+
+
+def make_tool(name: str, properties: dict) -> Tool:
+    return Tool(
+        type="function",
+        function=Function(
+            name=name,
+            description=f"{name} tool",
+            parameters={"type": "object", "properties": properties},
+        ),
+    )
+
+
+EVENT_TOOL = make_tool(
+    "create_event",
+    {
+        "event": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "location": {"type": "string"},
+                "attendees": {"type": "array", "items": {"type": "string"}},
+            },
+        }
+    },
+)
+
+EVENT_EV = {"title": "Team Meeting", "location": "Lahore", "attendees": ["Ali", "Sara"]}
+BASH_TOOL = make_tool("execute_bash", {"command": {"type": "string"}})
+
+
+def tool_call_text(body: str, func: str = "create_event") -> str:
+    return f"<tool_call>{NL}<function={func}>{NL}{body}{NL}</tool_call>"
+
+
+def stream(text: str, tools: list, chunk_size: int | None = None):
+    """Feed text through the streaming detector; return (detector, calls, normal).
+
+    chunk_size=None feeds the whole text in one increment (whole-chunk mode);
+    an int feeds fixed-size chunks (token-ish mode); 1 feeds char-by-char.
+    """
+    d = Qwen3CoderDetector()
+    calls, normal = [], ""
+    chunks = [text] if chunk_size is None else [
+        text[i : i + chunk_size] for i in range(0, len(text), chunk_size)
+    ]
+    for chunk in chunks:
+        r = d.parse_streaming_increment(chunk, tools)
+        calls.extend(r.calls)
+        normal += r.normal_text
+    return d, calls, normal
+
+
+def joined_args(calls) -> str:
+    return "".join(c.parameters for c in calls if c.name is None)
+
+
+def flush_args(d) -> list:
+    return d.flush_pending()
+
+
+class TestSafeLiteralEval(unittest.TestCase):
+    """Backported helper: ast.literal_eval with warnings suppressed."""
+
+    def test_01_basic_literals(self):
+        self.assertEqual(safe_literal_eval("{'a': 1}"), {"a": 1})
+        self.assertEqual(safe_literal_eval("(1, 2)"), (1, 2))
+        self.assertEqual(safe_literal_eval("[1, 2]"), [1, 2])
+        self.assertEqual(safe_literal_eval("42"), 42)
+
+    def test_02_invalid_escape_no_warning(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # any warning -> raise
+            self.assertEqual(safe_literal_eval(r"'\d+'"), r"\d+")
+
+    def test_03_invalid_escape_thread_safe(self):
+        # catch_warnings mutates global state; concurrent calls must all work.
+        results, errors = [], []
+
+        def worker():
+            for _ in range(50):
+                try:
+                    results.append(safe_literal_eval(r"'\w+\s\d'"))
+                except Exception as e:  # pragma: no cover
+                    errors.append(e)
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 400)
+
+    def test_04_rejects_non_literal(self):
+        with self.assertRaises(Exception):
+            safe_literal_eval("__import__('os')")
+
+
+class TestGetSchemaProperties(unittest.TestCase):
+    """Backported helper: properties lookup with anyOf/oneOf/allOf descent."""
+
+    def test_05_direct_properties(self):
+        schema = {"type": "object", "properties": {"a": {"type": "string"}}}
+        self.assertEqual(get_schema_properties(schema)["a"]["type"], "string")
+
+    def test_06_anyof_descent(self):
+        schema = {
+            "type": "object",
+            "anyOf": [
+                {"properties": {"sql": {"type": "string"}}},
+                {"properties": {"rows": {"type": "array"}}},
+            ],
+        }
+        props = get_schema_properties(schema)
+        self.assertIn("sql", props)
+        self.assertIn("rows", props)
+
+    def test_07_oneof_allof_and_non_dict(self):
+        one = get_schema_properties({"oneOf": [{"properties": {"x": 1}}]})
+        all_ = get_schema_properties({"allOf": [{"properties": {"y": 2}}]})
+        self.assertEqual(set(one), {"x"})
+        self.assertEqual(set(all_), {"y"})
+        self.assertEqual(get_schema_properties("not-a-dict"), {})
+        self.assertEqual(get_schema_properties(None), {})
+
+    def test_08_first_branch_wins_on_conflict(self):
+        schema = {
+            "anyOf": [
+                {"properties": {"k": "branch1"}},
+                {"properties": {"k": "branch2"}},
+            ]
+        }
+        self.assertEqual(get_schema_properties(schema)["k"], "branch1")
+
+
+class TestFlushMidParameter(unittest.TestCase):
+    """The core fix: EOS/stop arrives before </parameter> (create_event)."""
+
+    UNCLOSED = (
+        f"<parameter=event>{NL}"
+        '{"title": "Team Meeting", "location": "Lahore", '
+        '"attendees": ["Ali", "Sara"]}'
+    )
+
+    def _run(self, text: str, chunking):
+        d, calls, _ = stream(text, [EVENT_TOOL], chunking)
+        flush = flush_args(d)
+        all_calls = calls + flush
+        args = joined_args(all_calls)
+        self.assertTrue(
+            args.startswith("{") and args.endswith("}"),
+            f"args not braced: {args!r}",
+        )
+        parsed = json.loads(args)
+        self.assertEqual(parsed["event"], EVENT_EV)
+        self.assertEqual(
+            d.prev_tool_call_arr[0]["arguments"]["event"],
+            EVENT_EV,
+            "prev_tool_call_arr must carry the reconstructed nested object",
+        )
+        self.assertTrue(d.current_tool_args_closed)
+        # streamed_args must mirror the emitted fragments
+        self.assertEqual(
+            d.streamed_args_for_tool[0],
+            args,
+            "streamed_args_for_tool must equal reconstructed JSON",
+        )
+
+    def test_09_flush_char_streaming(self):
+        self._run(tool_call_text(self.UNCLOSED), 1)
+
+    def test_10_flush_whole_chunk(self):
+        self._run(tool_call_text(self.UNCLOSED), None)
+
+    def test_11_flush_token_chunks(self):
+        self._run(tool_call_text(self.UNCLOSED), 7)
+
+    def test_12_flush_scalar_param(self):
+        # Unclosed *scalar* (string) parameter, e.g. execute_bash command.
+        text = tool_call_text("<parameter=command>pwd && ls", func="execute_bash")
+        d, calls, _ = stream(text, [BASH_TOOL], 1)
+        flush = flush_args(d)
+        args = joined_args(calls + flush)
+        self.assertEqual(json.loads(args), {"command": "pwd && ls"})
+
+    def test_13_flush_after_complete_params_is_noop(self):
+        # Closed tool call: flush must emit nothing.
+        text = (
+            tool_call_text(
+                f'<parameter=event>{NL}{json.dumps(EVENT_EV)}{NL}</parameter>'
+            )
+            + f"{NL}</function>"
+        )
+        d, calls, _ = stream(text, [EVENT_TOOL], 1)
+        self.assertEqual(joined_args(calls), json.dumps({"event": EVENT_EV}))
+        self.assertEqual(flush_args(d), [])
+
+    def test_14_flush_no_open_tool(self):
+        d, _, _ = stream("just chatting", [EVENT_TOOL], 1)
+        self.assertEqual(flush_args(d), [])
+
+
+class TestNestedTagEmission(unittest.TestCase):
+    """h1-h4: nested <parameter> tags must reconstruct full arguments."""
+
+    def _assert_both_chunkings(self, body, expected=None):
+        if expected is None:
+            expected = {"event": EVENT_EV}
+        text = tool_call_text(body) + f"{NL}</function>"
+        for cs in (1, 6):
+            with self.subTest(chunk=cs):
+                d, calls, _ = stream(text, [EVENT_TOOL], cs)
+                flush = flush_args(d)
+                self.assertEqual(json.loads(joined_args(calls + flush)), expected)
+                self.assertEqual(flush, [], "closed call must not be flushed again")
+
+    def test_15_h1_nested_parameter_tags(self):
+        self._assert_both_chunkings(
+            f"<parameter=event>{NL}"
+            f"<parameter=title>{NL}Team Meeting{NL}</parameter>{NL}"
+            f"<parameter=location>{NL}Lahore{NL}</parameter>{NL}"
+            f'<parameter=attendees>{NL}["Ali", "Sara"]{NL}</parameter>{NL}'
+            f"</parameter>"
+        )
+
+    def test_16_h2_nested_outer_unclosed(self):
+        self._assert_both_chunkings(
+            f"<parameter=event>{NL}"
+            f"<parameter=title>{NL}Team Meeting{NL}</parameter>{NL}"
+            f"<parameter=location>{NL}Lahore{NL}</parameter>{NL}"
+            f'<parameter=attendees>{NL}["Ali", "Sara"]{NL}</parameter>'
+        )
+
+    def test_17_h3_json_value_with_gt_and_braces(self):
+        value = {
+            "title": "a > b",
+            "meta": {"ok": True},
+            "attendees": ["Ali", "Sara"],
+        }
+        self._assert_both_chunkings(
+            f"<parameter=event>{NL}{json.dumps(value)}{NL}</parameter>",
+            {"event": value},
+        )
+
+    def test_18_h4_parameter_tag_split_across_chunks(self):
+        body = (
+            "<par" + "ameter=" + "ev" + "ent>" + NL
+            + json.dumps(EVENT_EV) + NL + "</parameter>"
+        )
+        text = tool_call_text(body) + f"{NL}</function>"
+        for cs in (1, 6):
+            with self.subTest(chunk=cs):
+                d, calls, _ = stream(text, [EVENT_TOOL], cs)
+                self.assertEqual(
+                    json.loads(joined_args(calls + flush_args(d))),
+                    {"event": EVENT_EV},
+                )
+
+
+class TestChunkSplitMarkers(unittest.TestCase):
+    """Markers split across chunk boundaries must never leak into output."""
+
+    def test_19_no_marker_leak(self):
+        text = (
+            "before"
+            + tool_call_text(
+                f'<parameter=event>{NL}{json.dumps(EVENT_EV)}{NL}</parameter>'
+            )
+            + f"{NL}</function>after"
+        )
+        for cs in (1, 2, 3, 5, 8):
+            with self.subTest(chunk=cs):
+                d, calls, normal = stream(text, [EVENT_TOOL], cs)
+                self.assertEqual(
+                    json.loads(joined_args(calls + flush_args(d))),
+                    {"event": EVENT_EV},
+                )
+                self.assertNotIn("<tool_call>", normal)
+                self.assertNotIn("<parameter=", normal)
+                self.assertNotIn("</parameter>", normal)
+                self.assertNotIn("<function=", normal)
+
+
+class TestEscapedQuotesAndUnicode(unittest.TestCase):
+    def test_20_escaped_quotes_in_json(self):
+        ev = {"title": 'say "hi"', "location": "a\\b", "attendees": []}
+        text = (
+            tool_call_text(f"<parameter=event>{NL}{json.dumps(ev)}{NL}</parameter>")
+            + f"{NL}</function>"
+        )
+        for cs in (1, None):
+            with self.subTest(chunk=cs):
+                d, calls, _ = stream(text, [EVENT_TOOL], cs)
+                self.assertEqual(
+                    json.loads(joined_args(calls + flush_args(d))), {"event": ev}
+                )
+
+    def test_21_unicode_content(self):
+        ev = {"title": "会议 🎉", "location": "Lahore", "attendees": ["Sara"]}
+        text = (
+            tool_call_text(f"<parameter=event>{NL}{json.dumps(ev)}{NL}</parameter>")
+            + f"{NL}</function>"
+        )
+        for cs in (1, None):
+            with self.subTest(chunk=cs):
+                d, calls, _ = stream(text, [EVENT_TOOL], cs)
+                self.assertEqual(
+                    json.loads(joined_args(calls + flush_args(d))), {"event": ev}
+                )
+
+
+class TestMultipleCallsAndStateReset(unittest.TestCase):
+    def test_22_two_sequential_calls_distinct_indices(self):
+        text = (
+            tool_call_text("<parameter=command>pwd</parameter>", "execute_bash")
+            + f"{NL}</function>{NL}"
+            + "middle text"
+            + NL
+            + tool_call_text(
+                f'<parameter=event>{NL}{{"title": "X"}}{NL}</parameter>', "create_event"
+            )
+            + f"{NL}</function>"
+        )
+        for cs in (1, None):
+            with self.subTest(chunk=cs):
+                d, calls, _ = stream(text, [BASH_TOOL, EVENT_TOOL], cs)
+                by_index = {}
+                for c in calls:
+                    if c.name is not None:
+                        continue
+                    by_index.setdefault(c.tool_index, "")
+                    by_index[c.tool_index] += c.parameters
+                self.assertEqual(json.loads(by_index[0]), {"command": "pwd"})
+                self.assertEqual(json.loads(by_index[1]), {"event": {"title": "X"}})
+                self.assertEqual(d.current_tool_id, 1)
+
+    def test_23_state_reset_after_close_then_new_call(self):
+        # Second call after a fully closed first one must start fresh JSON.
+        text = (
+            tool_call_text("<parameter=command>ls</parameter>", "execute_bash")
+            + f"{NL}</function>{NL}"
+            + tool_call_text("<parameter=command>pwd</parameter>", "execute_bash")
+            + f"{NL}</function>"
+        )
+        d, calls, _ = stream(text, [BASH_TOOL], 1)
+        args = {}
+        for c in calls:
+            if c.name is None:
+                args.setdefault(c.tool_index, "")
+                args[c.tool_index] += c.parameters
+        self.assertEqual(json.loads(args[0]), {"command": "ls"})
+        self.assertEqual(json.loads(args[1]), {"command": "pwd"})
+
+    def test_24_thinking_tool_thinking_tool_transition(self):
+        text = (
+            "<think>reason one</think>"
+            + tool_call_text("<parameter=command>pwd</parameter>", "execute_bash")
+            + f"{NL}</function>{NL}"
+            + "<think>reason two</think>"
+            + tool_call_text("<parameter=command>ls -la</parameter>", "execute_bash")
+            + f"{NL}</function>"
+        )
+        d, calls, _ = stream(text, [BASH_TOOL], 1)
+        args = {}
+        for c in calls:
+            if c.name is None:
+                args.setdefault(c.tool_index, "")
+                args[c.tool_index] += c.parameters
+        self.assertEqual(json.loads(args[0]), {"command": "pwd"})
+        self.assertEqual(json.loads(args[1]), {"command": "ls -la"})
+
+
+class TestSchemaDrivenConversion(unittest.TestCase):
+    def test_25_bare_json_body_closed(self):
+        # Whole tool-call body is bare JSON (no <parameter> tags).
+        text = tool_call_text(json.dumps({"event": EVENT_EV})) + f"{NL}</function>"
+        for cs in (1, None):
+            with self.subTest(chunk=cs):
+                d, calls, _ = stream(text, [EVENT_TOOL], cs)
+                self.assertEqual(
+                    json.loads(joined_args(calls + flush_args(d))),
+                    {"event": EVENT_EV},
+                )
+
+    def test_26_array_leaf_top_level(self):
+        tool = make_tool(
+            "create_event",
+            {"attendees": {"type": "array", "items": {"type": "string"}}},
+        )
+        text = (
+            tool_call_text('<parameter=attendees>["Ali", "Sara"]</parameter>')
+            + f"{NL}</function>"
+        )
+        d, calls, _ = stream(text, [tool], 1)
+        self.assertEqual(
+            json.loads(joined_args(calls + flush_args(d))),
+            {"attendees": ["Ali", "Sara"]},
+        )
+
+    def test_27_anyof_schema_both_paths(self):
+        tool = Tool(
+            type="function",
+            function=Function(
+                name="query_db",
+                description="db",
+                parameters={
+                    "type": "object",
+                    "anyOf": [
+                        {"properties": {"sql": {"type": "string"}}},
+                        {
+                            "properties": {
+                                "rows": {"type": "array", "items": {"type": "integer"}}
+                            }
+                        },
+                    ],
+                },
+            ),
+        )
+        # Non-streaming path
+        r = Qwen3CoderDetector().detect_and_parse(
+            tool_call_text("<parameter=sql>SELECT 1</parameter>", "query_db")
+            + f"{NL}</function>",
+            [tool],
+        )
+        self.assertEqual(json.loads(r.calls[0].parameters), {"sql": "SELECT 1"})
+        # Streaming path
+        d, calls, _ = stream(
+            tool_call_text("<parameter=rows>[1, 2]</parameter>", "query_db")
+            + f"{NL}</function>",
+            [tool],
+            1,
+        )
+        self.assertEqual(
+            json.loads(joined_args(calls + flush_args(d))), {"rows": [1, 2]}
+        )
+
+    def test_28_null_value(self):
+        tool = make_tool("create_event", {"event": {"type": "object"}})
+        text = tool_call_text("<parameter=event>null</parameter>") + f"{NL}</function>"
+        d, calls, _ = stream(text, [tool], 1)
+        self.assertEqual(json.loads(joined_args(calls + flush_args(d))), {"event": None})
+
+    def test_29_nonstream_unclosed_nested_param(self):
+        # detect_and_parse parity for the unclosed-nested case.
+        r = Qwen3CoderDetector().detect_and_parse(
+            tool_call_text('<parameter=event>{"title": "T"}') + f"{NL}",
+            [EVENT_TOOL],
+        )
+        self.assertEqual(json.loads(r.calls[0].parameters), {"event": {"title": "T"}})
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+
+

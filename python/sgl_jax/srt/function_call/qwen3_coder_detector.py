@@ -29,6 +29,10 @@ from sgl_jax.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sgl_jax.srt.function_call.ebnf_composer import EBNFComposer
+from sgl_jax.srt.function_call.utils import (
+    get_schema_properties,
+    safe_literal_eval,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,9 +53,7 @@ def _safe_val(raw: str) -> Any:
     except Exception:
         pass
     try:
-        import ast
-
-        return ast.literal_eval(raw)
+        return safe_literal_eval(raw)
     except Exception:
         return raw
 
@@ -125,7 +127,12 @@ class Qwen3CoderDetector(BaseFormatDetector):
             if tool.function.name == func_name:
                 params = tool.function.parameters
                 if isinstance(params, dict):
-                    return params.get("properties", {}) or {}
+                    # Descend into anyOf/oneOf/allOf when the top level
+                    # declares no properties (upstream 0665102ce5).
+                    properties = get_schema_properties(params)
+                    if properties or "properties" in params:
+                        return properties
+                    return params
                 return {}
         return {}
 
@@ -141,6 +148,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
         self, param_value: str, param_name: str, param_config: dict
     ) -> Any:
         """Convert a raw parameter value according to the tool schema."""
+        # Handle null value for any type (upstream parity).
         if param_value.lower() == "null":
             return None
         if param_name not in param_config:
@@ -150,6 +158,10 @@ class Qwen3CoderDetector(BaseFormatDetector):
                     "returning the raw string value.",
                     param_name,
                 )
+            # Target extension (differs from upstream, which returns the raw
+            # string): nested <parameter> leaves are looked up against the
+            # top-level config and will not match, so keep the lenient
+            # json.loads/literal_eval fallback for them.
             return _safe_val(param_value)
         param_type = self._get_param_type(param_config[param_name])
         if param_type in ("string", "str", "text", "varchar", "char", "enum"):
@@ -191,10 +203,19 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 except Exception:
                     continue
             logger.warning(
-                "Parameter %r is not valid JSON; degenerating to string.", param_name
+                "Parameter %r is not valid JSON; trying Python literal fallback.", param_name
             )
-            return _safe_val(param_value)
-        return _safe_val(param_value)
+        # Fallback: Python-literal style values (ast.literal_eval), with
+        # invalid-escape warnings suppressed (upstream safe_literal_eval).
+        try:
+            return safe_literal_eval(param_value)
+        except Exception:
+            logger.warning(
+                "Parameter %r cannot be converted via Python `ast.literal_eval()`; "
+                "degenerating to string.",
+                param_name,
+            )
+            return param_value
 
     def _current_tool_schema(self) -> dict:
         """JSON-schema properties of the tool call currently being parsed."""
@@ -636,6 +657,11 @@ class Qwen3CoderDetector(BaseFormatDetector):
 
         if self.parsed_pos > 0:
             self._buffer = self._buffer[self.parsed_pos :]
+            # Keep the open-parameter record valid in the *sliced* buffer,
+            # otherwise flush_pending() reads from a shifted offset and
+            # truncates the value (differs by parsed_pos bytes).
+            if self._open_param_value_start is not None:
+                self._open_param_value_start -= self.parsed_pos
             self.parsed_pos = 0
 
         normal_text = "".join(normal_text_chunks)
@@ -668,8 +694,12 @@ class Qwen3CoderDetector(BaseFormatDetector):
             if isinstance(parsed, dict):
                 parsed = self._conform_params_to_schema(parsed)
             if param_name:
+                # _convert_param_value expects the *raw text* (it calls
+                # .lower() / json.dumps on it); passing an already-parsed
+                # dict/list crashed with AttributeError and killed the
+                # stream right after the leading '{' was emitted.
                 converted = self._convert_param_value(
-                    raw if not isinstance(parsed, (dict, list)) else parsed,
+                    raw,
                     param_name,
                     self._get_arguments_config(self.current_func_name),
                 )
