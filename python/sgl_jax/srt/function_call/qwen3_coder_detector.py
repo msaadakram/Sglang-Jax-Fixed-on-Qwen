@@ -25,6 +25,7 @@ from sgl_jax.srt.entrypoints.openai.protocol import Tool
 from sgl_jax.srt.function_call.base_format_detector import BaseFormatDetector
 from sgl_jax.srt.function_call.core_types import (
     StreamingParseResult,
+    StructureInfo,
     ToolCallItem,
     _GetInfoFunc,
 )
@@ -733,7 +734,17 @@ class Qwen3CoderDetector(BaseFormatDetector):
         return True
 
     def structure_info(self) -> _GetInfoFunc:
-        raise NotImplementedError
+        # Previously raised NotImplementedError, which crashed
+        # get_structure_tag() for strict-tool auto mode. Provide the native
+        # XML envelope so strict structural_tag grammars can be built if
+        # ever enabled (supports_structural_tag stays False for now; the
+        # thinking-tolerant lark path in FunctionCallParser is preferred for
+        # forced tool_choice with reasoning).
+        return lambda name: StructureInfo(
+            begin="<tool_call>\n<function=" + name + ">\n",
+            end="\n</function>\n</tool_call>",
+            trigger="<tool_call>",
+        )
 
     def build_ebnf(self, tools: list[Tool]):
         return EBNFComposer.build_ebnf(

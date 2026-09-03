@@ -190,7 +190,7 @@ To see the full set of `--reasoning-parser` keys available in your build, run `p
 
 ### 3.3 Tool Calling
 
-Launch with `--tool-call-parser qwen25` (compatible with Qwen3 tool-call format) plus `--reasoning-parser qwen3` if you also want thinking. Append these flags to the §2.3 launch command.
+Launch with `--tool-call-parser qwen3_coder --reasoning-parser qwen3` for Qwen3 / Qwen3.8 native XML tool calls (`<tool_call><function=..><parameter=..>`). This is required for `tool_choice="required"` with thinking enabled (see TC-45: the `qwen25` JSON detector has no thinking-tolerant grammar and collapses to a degenerate stream when forced). Use `--tool-call-parser qwen25` only for legacy Qwen2.5 JSON (`<tool_call>{"name":..}`) models. Append these flags to the §2.3 launch command.
 
 ```python
 from openai import OpenAI

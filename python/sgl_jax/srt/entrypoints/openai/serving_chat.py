@@ -174,6 +174,33 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
             request.chat_template_kwargs.setdefault("enable_thinking", False)
 
+        # TC-45 regression: forced tool_choice (required / specific function)
+        # with thinking active but a json_schema fallback grammar (e.g. qwen25
+        # detector, which has no thinking-tolerant structural tag) masks the
+        # <think> token at position 0. At temperature 0 the model then emits
+        # EOS/stop immediately (1-token empty completion) or degenerates into
+        # a repeated "|" stream with zero tool calls. The thinking-aware
+        # structural_tag path above keeps thinking enabled; the json_schema
+        # fallback cannot, so disable thinking here (template then injects an
+        # empty thinking prefix instead).
+        if (
+            tool_call_constraint
+            and tool_call_constraint[0] == "json_schema"
+            and self._get_reasoning_from_request(request)
+            and (
+                request.tool_choice == "required"
+                or not isinstance(request.tool_choice, str)
+            )
+        ):
+            if request.chat_template_kwargs is None:
+                request.chat_template_kwargs = {}
+            if "enable_thinking" not in request.chat_template_kwargs:
+                logger.debug(
+                    "Disabling thinking mode: forced tool_choice json_schema "
+                    "fallback is incompatible with from-token-0 thinking"
+                )
+            request.chat_template_kwargs.setdefault("enable_thinking", False)
+
         # Use chat template
         if self.template_manager.chat_template_name is None:
             result = self._apply_jinja_template(request, tools, is_multimodal)

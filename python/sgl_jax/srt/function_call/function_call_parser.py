@@ -37,7 +37,22 @@ class FunctionCallParser:
         "glm45": Glm4MoeDetector,
     }
 
-    def __init__(self, tools: list[Tool], tool_call_parser: str):
+    def __init__(self, tools: list[Tool], tool_call_parser: str | None):
+        # Auto-default when the server was launched without an explicit
+        # --tool-call-parser (upstream sglang auto-detects from the chat
+        # template; this fork previously raised ValueError -> HTTP 500).
+        # Qwen3 / Qwen3.8 family defaults to the native XML qwen3_coder
+        # format (<tool_call><function=..><parameter=..>), which is also
+        # what the thinking-tolerant forced-tool_choice path requires.
+        # See TC-45 (tool_choice=required with thinking collapsed to a
+        # degenerate "|" stream when no grammar could be built).
+        if not tool_call_parser:
+            logger.warning(
+                "No tool_call_parser configured; defaulting to 'qwen3_coder' "
+                "(Qwen3/Qwen3.8 native XML format). Launch with an explicit "
+                "--tool-call-parser to silence this warning."
+            )
+            tool_call_parser = "qwen3_coder"
         detector: type[BaseFormatDetector] = None
         detector_class = self.ToolCallParserEnum.get(tool_call_parser)
         if detector_class:
@@ -47,6 +62,7 @@ class FunctionCallParser:
 
         self.detector = detector
         self.tools = tools
+        self.tool_call_parser = tool_call_parser
 
     def has_tool_call(self, text: str) -> bool:
         """
