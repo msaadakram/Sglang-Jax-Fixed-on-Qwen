@@ -240,20 +240,26 @@ class FunctionCallParser:
             line for line in body_lark.splitlines() if not line.startswith("%llguidance")
         )
 
-        # Main grammar: required <think>...</think> reasoning (bare special-
-        # token references -- quoted literals cannot match special tokens),
-        # then one or more <tool_call> structures via the trigger mechanism.
-        # The free text is a lazy lexeme (identical mechanism to
-        # StructTag.to_grammar), which is the only llguidance construct that
-        # supports "any text, then structure" without lexer-state explosion.
+        # Main grammar: a lazy free-text lexeme (the model's reasoning
+        # preamble, which may contain any tokens incl. special  thinking
+        # sequences) that STOPS at the <tool_call> trigger (mirrors
+        # StructTag.to_grammar's [lazy] trigger rule), then one or more
+        # <tool_call> structures via the tag_body sub-grammar.
+        #
+        # NOTE:  thinking/ response must NOT be referenced as bare names --
+        # llguidance resolves unquoted identifiers as special-token
+        # references, and LLTokenizer rejects unknown ones ("unknown special
+        # token"), which turns the constraint into INVALID_GRAMMAR_OBJ (no
+        # constraint at all -> the model chats freely instead of forcing a
+        # tool call). The lazy TAG_TEXT lexeme is the tokenizer-agnostic way
+        # to allow free text up to the trigger.
         main_lark = (
             "%llguidance {}\n\n"
-            "start: think_part tool_tag* trailing_text?\n"
-            "think_part: <think> /(.|\\n)*/ </think>\n"
-            "trailing_text: /(.|\\n)*/\n"
-            "tool_tag: TAG_TEXT <tool_call> @tag_body "
-            f'"{self.detector.tool_call_end_token}"\n'
             "TAG_TEXT: /(.|\\n)*/\n"
+            "start: tool_tag+\n"
+            'tool_tag_trig[lazy]: TAG_TEXT "<tool_call>"\n'
+            "tool_tag: tool_tag_trig /[ \\n\t]/* @tag_body /[ \\n\t]/* "
+            f'"{self.detector.tool_call_end_token}"\n'
         )
         from sgl_jax.srt.entrypoints.openai.protocol import (
             StructuralTagResponseFormat,

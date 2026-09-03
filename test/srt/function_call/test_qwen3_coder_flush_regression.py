@@ -482,6 +482,68 @@ class TestSchemaDrivenConversion(unittest.TestCase):
         )
         self.assertEqual(json.loads(r.calls[0].parameters), {"event": {"title": "T"}})
 
+    def test_30_thinking_forced_tag_compiles_and_accepts_tool_call(self):
+        """Thinking-tolerant structural tag must compile in llguidance and
+        accept a full reasoning + tool call (the forced tool_choice path).
+
+        Regression: the tag previously referenced  thinking/ response as
+        bare special-token names, which llguidance rejects ("unknown special
+        token") -> INVALID_GRAMMAR_OBJ -> no constraint -> tool_choice=required
+        silently chatted instead of forcing a tool call.
+        """
+        try:
+            import importlib.util
+
+            if importlib.util.find_spec("llguidance") is None:
+                self.skipTest("llguidance not installed")
+        except (ImportError, ValueError):
+            self.skipTest("llguidance not importable")
+
+        import os
+
+        from llguidance import LLTokenizer
+
+        from sgl_jax.srt.constrained.llguidance_backend import GuidanceBackend
+        from sgl_jax.srt.entrypoints.openai.protocol import ToolChoice
+        from sgl_jax.srt.function_call.function_call_parser import FunctionCallParser
+
+        tok_path = os.environ.get("SGL_JAX_TEST_TOKENIZER_JSON")
+        if not tok_path or not os.path.exists(tok_path):
+            self.skipTest("SGL_JAX_TEST_TOKENIZER_JSON not set")
+
+        tok = LLTokenizer(tok_path)
+        tool = make_tool(
+            "get_weather",
+            {"city": {"type": "string"}},
+        )
+        tc = ToolChoice.model_validate(
+            {"type": "function", "function": {"name": "get_weather"}}
+        )
+        p = FunctionCallParser([tool], "qwen3_coder")
+        c = p.get_structure_constraint(tc, thinking=True)
+        self.assertIsNotNone(c)
+        kind, value = c
+        self.assertEqual(kind, "structural_tag")
+        key = value.model_dump_json(by_alias=True)
+        g = GuidanceBackend(tokenizer=tok).dispatch_structural_tag(key)
+        self.assertTrue(hasattr(g, "ll_matcher"), "thinking tag compiled to INVALID_GRAMMAR_OBJ")
+        m = g.ll_matcher
+        self.assertFalse(m.is_error(), m.get_error())
+        # Free text (reasoning) + full forced tool call must be accepted.
+        full = (
+            "Let me think about the weather\n\n"
+            "<tool_call>\n<function=get_weather>\n<parameter=city>\n"
+            "Lahore\n</parameter>\n</function>\n</tool_call>"
+        )
+        for i in tok.greedy_tokenize(full):
+            m.consume_token(i)
+            if m.is_error():
+                self.fail(
+                    f"grammar rejected token {tok.decode_str([i])[:30]!r}: {m.get_error()}"
+                )
+            if m.is_stopped():
+                break
+
 
 if __name__ == "__main__":
     unittest.main()

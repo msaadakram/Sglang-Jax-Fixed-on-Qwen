@@ -829,10 +829,16 @@ class TestForcedToolChoice(unittest.TestCase):
         self.assertIn("struct_tag", d["lark_grammars"])
         self.assertIn("tag_body", d["lark_grammars"])
         main = d["lark_grammars"]["struct_tag"]
-        # bare special-token references (quoted literals cannot match them)
-        self.assertIn("think_part: <think>", main)
-        self.assertIn("</think>", main)
+        # Tokenizer-agnostic thinking preamble: a [lazy] free-text lexeme
+        # that stops at the <tool_call> trigger (StructTag.to_grammar's
+        # mechanism). No bare  thinking/ response special-token
+        # references -- llguidance rejects unknown special tokens, which
+        # would turn the constraint into INVALID_GRAMMAR_OBJ (no constraint).
+        self.assertIn("tool_tag_trig[lazy]", main)
+        self.assertIn("TAG_TEXT", main)
+        self.assertIn("<tool_call>", main)
         self.assertIn("@tag_body", main)
+        self.assertNotIn("think_part:  thinking", main)
 
     def test_forced_tool_call_with_thinking_non_stream(self):
         text = THINK_BLOCK + tool_call_xml("get_weather", {"city": "Tokyo"})
