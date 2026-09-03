@@ -57,6 +57,13 @@ class OpenAIServingChat(OpenAIServingBase):
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
 
+
+    def _validate_request(self, request: ChatCompletionRequest) -> str | None:
+        """Validate the OpenAI chat-completion request surface (OpenAI parity)."""
+        if not request.messages:
+            return "Messages cannot be empty."
+        return None
+
     def _convert_to_internal_request(
         self,
         request: ChatCompletionRequest,
