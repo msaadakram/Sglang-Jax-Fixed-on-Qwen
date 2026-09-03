@@ -12,6 +12,39 @@ default_mesh_axes = [
 ]
 
 
+def _device_summary(devices) -> str:
+    """Short human summary of available devices, e.g. '3 x tpu-v5e-pcie-8'."""
+    counts: dict[str, int] = {}
+    for dev in devices:
+        key = f"{getattr(dev, 'platform', '?')} ({getattr(dev, 'device_kind', '?')})"
+        counts[key] = counts.get(key, 0) + 1
+    return "; ".join(f"{n} x {k}" for k, n in sorted(counts.items())) or "none"
+
+
+def _validate_device_mesh_shape(
+    mesh_shape: Sequence[int],
+    num_devices: int,
+    devices,
+    requested_by: str,
+) -> None:
+    """Raise a clear, actionable error before JAX's cryptic mesh assertion."""
+    required = int(np.prod(mesh_shape, dtype=int))
+    if num_devices == required:
+        return
+    raise ValueError(
+        f"Cannot create device mesh of shape {tuple(mesh_shape)} "
+        f"({requested_by} needs {required} device(s)): only {num_devices} device(s) "
+        f"available ({_device_summary(devices)}).\n"
+        f"Remedies:\n"
+        f"  * If you intend to serve on a TPU, make sure a TPU accelerator is "
+        f"attached and that TPU_ACCELERATOR_TYPE / TPU_WORKER_HOSTNAMES are set "
+        f"(e.g. enable TPU in the runtime/VM);\n"
+        f"  * Otherwise reduce the requested parallelism to match the available "
+        f"device count (e.g. --tp-size {num_devices} --dp-size 1), or run on a "
+        f"non-TPU backend with --device cpu."
+    )
+
+
 def create_device_mesh(
     ici_parallelism: MutableSequence[int],
     dcn_parallelism: MutableSequence[int],
@@ -35,6 +68,12 @@ def create_device_mesh(
     ici_parallelism = fill_unspecified_parallelism(ici_parallelism, len(devices))
     if num_slices > 1:
         dcn_parallelism = fill_unspecified_parallelism(dcn_parallelism, num_slices)
+        _validate_device_mesh_shape(
+            mesh_shape=ici_parallelism + dcn_parallelism,
+            num_devices=len(devices),
+            devices=devices,
+            requested_by=f"ici_parallelism x dcn_parallelism (num_slices={num_slices})",
+        )
         devices_array = mesh_utils.create_hybrid_device_mesh(
             ici_parallelism,
             dcn_parallelism,
@@ -48,8 +87,20 @@ def create_device_mesh(
             # JAX's create_device_mesh infers the full physical TPU topology
             # and asserts len(devices) == np.prod(dims), which fails when
             # only a subset of devices is used.  Fall back to a simple reshape.
+            _validate_device_mesh_shape(
+                mesh_shape=ici_parallelism,
+                num_devices=len(devices),
+                devices=devices,
+                requested_by="ici_parallelism",
+            )
             devices_array = np.array(devices).reshape(ici_parallelism)
         else:
+            _validate_device_mesh_shape(
+                mesh_shape=ici_parallelism,
+                num_devices=len(devices),
+                devices=devices,
+                requested_by="ici_parallelism",
+            )
             devices_array = mesh_utils.create_device_mesh(
                 ici_parallelism,
                 devices=devices,
