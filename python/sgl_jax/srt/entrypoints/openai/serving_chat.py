@@ -134,21 +134,37 @@ class OpenAIServingChat(OpenAIServingBase):
                 request.tool_choice, thinking=thinking_active
             )
 
-        # Structural_tag grammars block special tokens like <think>.
-        # Disable thinking so the template injects an empty <think></think>
-        # prefix instead of letting the model generate <think> itself.
+        # Structural_tag / json_schema grammars block special tokens like
+        #   thinking.  Disable thinking so the template injects an empty
+        #   thinking response prefix instead of letting the model generate
+        #   thinking itself.
         # EXCEPTION: constraints built with thinking=True are thinking-aware
-        # (the tag's free text is a lazy lexeme, so <think>...</think> can
+        # (the tag's free text is a lazy lexeme, so ​ thinking... response can
         # precede the <tool_call> trigger) and must keep thinking enabled.
+        from_token_0_grammar = False
+        if request.response_format and request.response_format.type in (
+            "json_schema",
+            "json_object",
+        ):
+            # A from-token-0 json_schema/object grammar masks the  thinking
+            # token a reasoning model wants to emit first; at low temperature
+            # the model then deterministically emits EOS/stop, producing an
+            # empty completion (observed live: json_object/json_schema
+            # requests returned content='' with completion_tokens=1).  No
+            # ReasonerGrammarBackend layer exists in this fork, so disable
+            # thinking for such requests.
+            from_token_0_grammar = True
         if (
             tool_call_constraint
             and tool_call_constraint[0] == "structural_tag"
             and not self._get_reasoning_from_request(request)
-        ):
+        ) or (from_token_0_grammar and self._get_reasoning_from_request(request)):
             if request.chat_template_kwargs is None:
                 request.chat_template_kwargs = {}
             if "enable_thinking" not in request.chat_template_kwargs:
-                logger.debug("Disabling thinking mode: incompatible with structural_tag grammar")
+                logger.debug(
+                    "Disabling thinking mode: incompatible with from-token-0 output grammar"
+                )
             request.chat_template_kwargs.setdefault("enable_thinking", False)
 
         # Use chat template
