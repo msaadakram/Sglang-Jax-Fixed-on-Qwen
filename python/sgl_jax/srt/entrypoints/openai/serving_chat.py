@@ -124,6 +124,28 @@ class OpenAIServingChat(OpenAIServingBase):
         # Apply chat template and its stop strings
         tools = None
         if request.tools and request.tool_choice != "none":
+            # TC-45 (tool_choice=required compliance): a forced tool_choice must
+            # be enforced by a from-token-0 grammar that REJECTS free text
+            # (json_schema). The thinking-tolerant structural_tag built below
+            # when thinking is active instead allows indefinite free-text
+            # reasoning (lazy TAG_TEXT prefix) and only forbids EOS without a
+            # <tool_call>. A model instructed to "answer directly from your own
+            # knowledge" (bench SYSTEM_PROMPT) then loops in thinking and never
+            # emits the trigger within budget -> "No tool calls despite
+            # tool_choice='required'" (missing_step). Disable thinking FIRST so
+            # the constraint is the forcing json_schema, not the permissive tag.
+            # The template then injects an empty thinking prefix instead of
+            # letting the model generate thinking itself.
+            is_forced_tool_choice = (
+                request.tool_choice == "required"
+                or not isinstance(request.tool_choice, str)
+            )
+            if is_forced_tool_choice and self._thinking_maybe_active(request):
+                self._disable_thinking_for_incompatible_grammar(
+                    request,
+                    "forced tool_choice requires from-token-0 enforcement "
+                    "(thinking-tolerant grammar allows free-text bypass)",
+                )
             request.skip_special_tokens = False
             if not isinstance(request.tool_choice, str):
                 tools = [
@@ -196,6 +218,18 @@ class OpenAIServingChat(OpenAIServingBase):
             )
 
         # Use chat template
+        # Upstream parity: forward tool_choice=required/none to the Jinja chat
+        # template so templates that branch on it render the forcing prompt.
+        # (Qwen3 templates ignore it; enforcement here comes from the
+        # from-token-0 json_schema grammar above.)
+        if (
+            tools is not None
+            and isinstance(request.tool_choice, str)
+            and request.tool_choice in ("required", "none")
+        ):
+            if request.chat_template_kwargs is None:
+                request.chat_template_kwargs = {}
+            request.chat_template_kwargs.setdefault("tool_choice", request.tool_choice)
         if self.template_manager.chat_template_name is None:
             result = self._apply_jinja_template(request, tools, is_multimodal)
         else:

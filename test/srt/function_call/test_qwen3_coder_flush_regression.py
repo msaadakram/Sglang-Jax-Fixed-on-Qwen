@@ -545,6 +545,118 @@ class TestSchemaDrivenConversion(unittest.TestCase):
                 break
 
 
+class TestTC45ForcedCompliance(unittest.TestCase):
+    """TC-45: tool_choice=required must use a forcing grammar, not the
+    permissive thinking-tolerant tag.
+
+    The thinking-tolerant structural_tag allows indefinite free-text reasoning
+    (lazy TAG_TEXT) and only forbids EOS without a <tool_call>. With the bench
+    SYSTEM_PROMPT ("If you can answer directly ... do so without calling a
+    tool"), the model loops in thinking ("7 times 8 is 56" x500) and never
+    emits the trigger -> missing_step fail. Forced tool_choice must therefore
+    disable thinking FIRST so the constraint is the from-token-0 json_schema,
+    which rejects free text outright.
+    """
+
+    def _make_serving(self, reasoning_parser="qwen3", tool_parser="qwen3_coder"):
+        from unittest.mock import MagicMock
+
+        from sgl_jax.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+
+        tok_mgr = MagicMock()
+        tok_mgr.server_args.reasoning_parser = reasoning_parser
+        tok_mgr.server_args.tool_call_parser = tool_parser
+        tmpl_mgr = MagicMock()
+        tmpl_mgr.chat_template_name = None
+        tok_mgr.tokenizer.apply_chat_template.return_value = [1, 2, 3]
+        tok_mgr.tokenizer.bos_token_id = 1
+        tok_mgr.mm_processor = None
+        tmpl_mgr.jinja_template_content_format = "openai"
+        return OpenAIServingChat(tok_mgr, tmpl_mgr)
+
+    def _make_request(self, tool_choice="required", chat_kwargs=None):
+        from sgl_jax.srt.entrypoints.openai.protocol import ChatCompletionRequest
+
+        calc = make_tool("calculator", {"expression": {"type": "string"}})
+        req = ChatCompletionRequest.model_validate(
+            {
+                "model": "qwen3.8-27b",
+                "messages": [{"role": "user", "content": "What is 7 times 8?"}],
+                "tools": [calc.model_dump()],
+                "tool_choice": tool_choice,
+                "temperature": 0.0,
+                "chat_template_kwargs": dict(chat_kwargs) if chat_kwargs else None,
+            }
+        )
+        return req
+
+    def test_31_forced_required_disables_thinking_and_forces_json_schema(self):
+        for rp, tp, kwargs in [
+            ("qwen3", "qwen3_coder", None),
+            ("qwen3", "qwen3_coder", {"enable_thinking": True}),
+            (None, "qwen3_coder", None),
+            (None, "qwen25", None),
+            ("qwen3", "qwen25", None),
+        ]:
+            with self.subTest(reasoning_parser=rp, tool_parser=tp, kwargs=kwargs):
+                svc = self._make_serving(rp, tp)
+                req = self._make_request("required", kwargs)
+                res = svc._process_messages(req, is_multimodal=False)
+                self.assertIsNotNone(res.tool_call_constraint)
+                self.assertEqual(res.tool_call_constraint[0], "json_schema")
+                self.assertIs(
+                    (req.chat_template_kwargs or {}).get("enable_thinking"),
+                    False,
+                    "forced tool_choice must disable thinking for from-token-0 enforcement",
+                )
+
+    def test_32_specific_function_forces_json_schema(self):
+        svc = self._make_serving("qwen3", "qwen3_coder")
+        req = self._make_request(
+            {"type": "function", "function": {"name": "calculator"}}
+        )
+        res = svc._process_messages(req, is_multimodal=False)
+        self.assertIsNotNone(res.tool_call_constraint)
+        self.assertEqual(res.tool_call_constraint[0], "json_schema")
+        self.assertIs(
+            (req.chat_template_kwargs or {}).get("enable_thinking"), False
+        )
+
+    def test_33_forcing_grammar_rejects_free_text(self):
+        try:
+            import importlib.util
+
+            if importlib.util.find_spec("llguidance") is None:
+                self.skipTest("llguidance not installed")
+        except (ImportError, ValueError):
+            self.skipTest("llguidance not importable")
+        import json
+        import os
+
+        from llguidance import LLTokenizer
+
+        from sgl_jax.srt.constrained.base_grammar_backend import INVALID_GRAMMAR_OBJ
+        from sgl_jax.srt.constrained.llguidance_backend import GuidanceBackend
+
+        tok_path = os.environ.get("SGL_JAX_TEST_TOKENIZER_JSON")
+        if not tok_path or not os.path.exists(tok_path):
+            self.skipTest("SGL_JAX_TEST_TOKENIZER_JSON not set")
+        svc = self._make_serving("qwen3", "qwen3_coder")
+        req = self._make_request("required")
+        res = svc._process_messages(req, is_multimodal=False)
+        schema = res.tool_call_constraint[1]
+        schema_str = schema if isinstance(schema, str) else json.dumps(schema)
+        tok = LLTokenizer(tok_path)
+        g = GuidanceBackend(tokenizer=tok).dispatch_json(schema_str)
+        self.assertIsNot(g, INVALID_GRAMMAR_OBJ)
+        toks = tok.greedy_tokenize("7 times 8 is 56.")
+        g.ll_matcher.consume_token(toks[0])
+        self.assertTrue(
+            g.ll_matcher.is_error(),
+            "forcing json_schema must reject free-text answer",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
 
