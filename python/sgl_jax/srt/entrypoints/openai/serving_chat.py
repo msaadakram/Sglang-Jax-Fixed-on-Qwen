@@ -165,14 +165,11 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_call_constraint
             and tool_call_constraint[0] == "structural_tag"
             and not self._get_reasoning_from_request(request)
-        ) or (from_token_0_grammar and self._get_reasoning_from_request(request)):
-            if request.chat_template_kwargs is None:
-                request.chat_template_kwargs = {}
-            if "enable_thinking" not in request.chat_template_kwargs:
-                logger.debug(
-                    "Disabling thinking mode: incompatible with from-token-0 output grammar"
-                )
-            request.chat_template_kwargs.setdefault("enable_thinking", False)
+        ) or (from_token_0_grammar and self._thinking_maybe_active(request)):
+            self._disable_thinking_for_incompatible_grammar(
+                request,
+                "incompatible with from-token-0 output grammar",
+            )
 
         # TC-45 regression: forced tool_choice (required / specific function)
         # with thinking active but a json_schema fallback grammar (e.g. qwen25
@@ -186,20 +183,17 @@ class OpenAIServingChat(OpenAIServingBase):
         if (
             tool_call_constraint
             and tool_call_constraint[0] == "json_schema"
-            and self._get_reasoning_from_request(request)
+            and self._thinking_maybe_active(request)
             and (
                 request.tool_choice == "required"
                 or not isinstance(request.tool_choice, str)
             )
         ):
-            if request.chat_template_kwargs is None:
-                request.chat_template_kwargs = {}
-            if "enable_thinking" not in request.chat_template_kwargs:
-                logger.debug(
-                    "Disabling thinking mode: forced tool_choice json_schema "
-                    "fallback is incompatible with from-token-0 thinking"
-                )
-            request.chat_template_kwargs.setdefault("enable_thinking", False)
+            self._disable_thinking_for_incompatible_grammar(
+                request,
+                "forced tool_choice json_schema fallback is incompatible "
+                "with from-token-0 thinking",
+            )
 
         # Use chat template
         if self.template_manager.chat_template_name is None:
@@ -1005,6 +999,43 @@ Assistant: {% endif %}"""
         if parser == "mimo":
             return kwargs.get("enable_thinking") is True
         return True
+
+    def _thinking_maybe_active(self, request: ChatCompletionRequest) -> bool:
+        """True when the model may emit <think> despite the reasoning parser.
+
+        _get_reasoning_from_request() returns False when the server was
+        launched without --reasoning-parser, but Qwen3-family chat templates
+        default enable_thinking to True, so the model still emits <think> and
+        any from-token-0 grammar (json_schema / forced tool_choice fallback)
+        still masks it -> 1-token EOS collapse or the degenerate "|" stream
+        seen in TC-45. Treat "not explicitly disabled" as possibly active so
+        those grammars still disable thinking. Forcing False on a
+        non-reasoning model is harmless (the template ignores the flag).
+        """
+        if self._get_reasoning_from_request(request):
+            return True
+        return (request.chat_template_kwargs or {}).get("enable_thinking", None) is not False
+
+    def _disable_thinking_for_incompatible_grammar(
+        self, request: ChatCompletionRequest, reason: str
+    ) -> None:
+        """Force enable_thinking=False for grammars that mask <think>.
+
+        Uses an override (not setdefault): an explicit enable_thinking=True
+        with a from-token-0 grammar deterministically collapses, so it must
+        be turned off with a warning rather than silently kept.
+        """
+        if request.chat_template_kwargs is None:
+            request.chat_template_kwargs = {}
+        current = request.chat_template_kwargs.get("enable_thinking", None)
+        if current is True:
+            logger.warning(
+                "Disabling thinking mode (overriding explicit enable_thinking=True): %s",
+                reason,
+            )
+        elif current is None:
+            logger.debug("Disabling thinking mode: %s", reason)
+        request.chat_template_kwargs["enable_thinking"] = False
 
     async def _process_tool_call_stream(
         self,
