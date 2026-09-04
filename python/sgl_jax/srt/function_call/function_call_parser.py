@@ -200,9 +200,22 @@ class FunctionCallParser:
                     return ("structural_tag", tag)
                 logger.warning(
                     "Detector does not support thinking-tolerant structural "
-                    "tags; falling back to json_schema for forced tool_choice "
-                    "(thinking conflicts with from-token-0 grammars)."
+                    "tags; falling back to from-token-0 grammar for forced "
+                    "tool_choice (thinking conflicts with from-token-0 grammars)."
                 )
+            # TC-45: force the detector's NATIVE format (not bare JSON) for
+            # Qwen when thinking is off. The bare-JSON json_schema array
+            # degenerates live on multi-tool required (1-token EOS collapse
+            # with 12 tools, whitespace/CR loop with 2) because the model was
+            # trained on <tool_call>-enveloped output, not bare [{...}].
+            # The serving layer disables thinking before calling here for
+            # forced tool_choice, so this EBNF applies from token 0 and
+            # rejects free text outright. Other parser families keep the
+            # json_schema fallback (their native EBNF is unvalidated live).
+            if not thinking and self.tool_call_parser in ("qwen25", "qwen3_coder"):
+                ebnf = self.get_ebnf(tool_choice)  # type: ignore[arg-type]
+                if ebnf is not None:
+                    return ("ebnf", ebnf)
             json_schema = get_json_schema_constraint(self.tools, tool_choice)
             if json_schema is None:
                 return None

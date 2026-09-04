@@ -747,7 +747,7 @@ class Qwen3CoderDetector(BaseFormatDetector):
         )
 
     def build_ebnf(self, tools: list[Tool]):
-        return EBNFComposer.build_ebnf(
+        ebnf = EBNFComposer.build_ebnf(
             tools,
             individual_call_start_token=self.tool_call_start_token.replace(chr(10), "\\n"),
             individual_call_end_token=self.tool_call_end_token.replace(chr(10), "\\n"),
@@ -757,3 +757,13 @@ class Qwen3CoderDetector(BaseFormatDetector):
             key_value_rule_fmt='"<parameter={key}>\\n" {valrule} "\\n</parameter>"',
             key_value_separator='"\\n"',
         )
+        # TC-45: the model natively emits a newline inside the envelope
+        # (<tool_call>\n<function=...>...\n</tool_call>), but the composed
+        # root rule above requires "<tool_call>" to be immediately followed
+        # by the function call. Under a from-token-0 forcing grammar that
+        # strictness masks the model's natural "\n" continuation and the
+        # generation collapses. Allow optional whitespace (ws matches empty,
+        # so the strict form still parses) inside the envelope.
+        ebnf = ebnf.replace('"<tool_call>" function_call', '"<tool_call>" ws function_call')
+        ebnf = ebnf.replace('function_call "</tool_call>"', 'function_call ws "</tool_call>"')
+        return ebnf

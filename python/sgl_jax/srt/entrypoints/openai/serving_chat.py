@@ -126,16 +126,17 @@ class OpenAIServingChat(OpenAIServingBase):
         if request.tools and request.tool_choice != "none":
             # TC-45 (tool_choice=required compliance): a forced tool_choice must
             # be enforced by a from-token-0 grammar that REJECTS free text
-            # (json_schema). The thinking-tolerant structural_tag built below
-            # when thinking is active instead allows indefinite free-text
-            # reasoning (lazy TAG_TEXT prefix) and only forbids EOS without a
-            # <tool_call>. A model instructed to "answer directly from your own
-            # knowledge" (bench SYSTEM_PROMPT) then loops in thinking and never
-            # emits the trigger within budget -> "No tool calls despite
+            # (native EBNF for Qwen, json_schema fallback otherwise). The
+            # thinking-tolerant structural_tag built below when thinking is
+            # active instead allows indefinite free-text reasoning (lazy
+            # TAG_TEXT prefix) and only forbids EOS without a <tool_call>. A
+            # model instructed to "answer directly from your own knowledge"
+            # (bench SYSTEM_PROMPT) then loops in thinking and never emits
+            # the trigger within budget -> "No tool calls despite
             # tool_choice='required'" (missing_step). Disable thinking FIRST so
-            # the constraint is the forcing json_schema, not the permissive tag.
-            # The template then injects an empty thinking prefix instead of
-            # letting the model generate thinking itself.
+            # the constraint is the forcing from-token-0 grammar, not the
+            # permissive tag. The template then injects an empty thinking
+            # prefix instead of letting the model generate thinking itself.
             is_forced_tool_choice = (
                 request.tool_choice == "required"
                 or not isinstance(request.tool_choice, str)
@@ -194,17 +195,18 @@ class OpenAIServingChat(OpenAIServingBase):
             )
 
         # TC-45 regression: forced tool_choice (required / specific function)
-        # with thinking active but a json_schema fallback grammar (e.g. qwen25
-        # detector, which has no thinking-tolerant structural tag) masks the
-        # <think> token at position 0. At temperature 0 the model then emits
-        # EOS/stop immediately (1-token empty completion) or degenerates into
-        # a repeated "|" stream with zero tool calls. The thinking-aware
-        # structural_tag path above keeps thinking enabled; the json_schema
-        # fallback cannot, so disable thinking here (template then injects an
-        # empty thinking prefix instead).
+        # with thinking active but a from-token-0 forcing grammar (native
+        # EBNF for Qwen, json_schema fallback otherwise) masks the <think>
+        # token at position 0. At temperature 0 the model then emits EOS/stop
+        # immediately (1-token empty completion) or degenerates into a
+        # repeated "|" stream with zero tool calls. The thinking-aware
+        # structural_tag path above keeps thinking enabled; from-token-0
+        # grammars cannot, so disable thinking here (template then injects an
+        # empty thinking prefix instead). Normally already disabled before the
+        # constraint was built; this is a safety net.
         if (
             tool_call_constraint
-            and tool_call_constraint[0] == "json_schema"
+            and tool_call_constraint[0] in ("json_schema", "ebnf")
             and self._thinking_maybe_active(request)
             and (
                 request.tool_choice == "required"
@@ -213,7 +215,7 @@ class OpenAIServingChat(OpenAIServingBase):
         ):
             self._disable_thinking_for_incompatible_grammar(
                 request,
-                "forced tool_choice json_schema fallback is incompatible "
+                "forced tool_choice from-token-0 grammar is incompatible "
                 "with from-token-0 thinking",
             )
 
@@ -221,7 +223,7 @@ class OpenAIServingChat(OpenAIServingBase):
         # Upstream parity: forward tool_choice=required/none to the Jinja chat
         # template so templates that branch on it render the forcing prompt.
         # (Qwen3 templates ignore it; enforcement here comes from the
-        # from-token-0 json_schema grammar above.)
+        # from-token-0 forcing grammar above.)
         if (
             tools is not None
             and isinstance(request.tool_choice, str)

@@ -554,8 +554,8 @@ class TestTC45ForcedCompliance(unittest.TestCase):
     SYSTEM_PROMPT ("If you can answer directly ... do so without calling a
     tool"), the model loops in thinking ("7 times 8 is 56" x500) and never
     emits the trigger -> missing_step fail. Forced tool_choice must therefore
-    disable thinking FIRST so the constraint is the from-token-0 json_schema,
-    which rejects free text outright.
+    disable thinking FIRST so the constraint is the forcing from-token-0
+    native EBNF, which rejects free text outright.
     """
 
     def _make_serving(self, reasoning_parser="qwen3", tool_parser="qwen3_coder"):
@@ -590,7 +590,7 @@ class TestTC45ForcedCompliance(unittest.TestCase):
         )
         return req
 
-    def test_31_forced_required_disables_thinking_and_forces_json_schema(self):
+    def test_31_forced_required_disables_thinking_and_forces_native_ebnf(self):
         for rp, tp, kwargs in [
             ("qwen3", "qwen3_coder", None),
             ("qwen3", "qwen3_coder", {"enable_thinking": True}),
@@ -603,21 +603,24 @@ class TestTC45ForcedCompliance(unittest.TestCase):
                 req = self._make_request("required", kwargs)
                 res = svc._process_messages(req, is_multimodal=False)
                 self.assertIsNotNone(res.tool_call_constraint)
-                self.assertEqual(res.tool_call_constraint[0], "json_schema")
+                # Qwen forced tool_choice uses the detector's NATIVE EBNF
+                # (bare-JSON json_schema degenerates live on multi-tool
+                # required: 1-token EOS with 12 tools, CR loop with 2).
+                self.assertEqual(res.tool_call_constraint[0], "ebnf")
                 self.assertIs(
                     (req.chat_template_kwargs or {}).get("enable_thinking"),
                     False,
                     "forced tool_choice must disable thinking for from-token-0 enforcement",
                 )
 
-    def test_32_specific_function_forces_json_schema(self):
+    def test_32_specific_function_forces_native_ebnf(self):
         svc = self._make_serving("qwen3", "qwen3_coder")
         req = self._make_request(
             {"type": "function", "function": {"name": "calculator"}}
         )
         res = svc._process_messages(req, is_multimodal=False)
         self.assertIsNotNone(res.tool_call_constraint)
-        self.assertEqual(res.tool_call_constraint[0], "json_schema")
+        self.assertEqual(res.tool_call_constraint[0], "ebnf")
         self.assertIs(
             (req.chat_template_kwargs or {}).get("enable_thinking"), False
         )
@@ -630,7 +633,6 @@ class TestTC45ForcedCompliance(unittest.TestCase):
                 self.skipTest("llguidance not installed")
         except (ImportError, ValueError):
             self.skipTest("llguidance not importable")
-        import json
         import os
 
         from llguidance import LLTokenizer
@@ -644,17 +646,60 @@ class TestTC45ForcedCompliance(unittest.TestCase):
         svc = self._make_serving("qwen3", "qwen3_coder")
         req = self._make_request("required")
         res = svc._process_messages(req, is_multimodal=False)
-        schema = res.tool_call_constraint[1]
-        schema_str = schema if isinstance(schema, str) else json.dumps(schema)
+        self.assertEqual(res.tool_call_constraint[0], "ebnf")
+        ebnf = res.tool_call_constraint[1]
+        self.assertIsInstance(ebnf, str)
         tok = LLTokenizer(tok_path)
-        g = GuidanceBackend(tokenizer=tok).dispatch_json(schema_str)
+        g = GuidanceBackend(tokenizer=tok).dispatch_ebnf(ebnf)
         self.assertIsNot(g, INVALID_GRAMMAR_OBJ)
         toks = tok.greedy_tokenize("7 times 8 is 56.")
         g.ll_matcher.consume_token(toks[0])
         self.assertTrue(
             g.ll_matcher.is_error(),
-            "forcing json_schema must reject free-text answer",
+            "forcing native EBNF must reject free-text answer",
         )
+
+    def test_34_native_ebnf_accepts_newlined_envelope(self):
+        """The qwen3_coder EBNF must accept the model's native envelope with
+        newlines (<tool_call>\\n<function=...>...), which the composed root
+        rule previously rejected (strict "<tool_call>" adjacency)."""
+        try:
+            import importlib.util
+
+            if importlib.util.find_spec("llguidance") is None:
+                self.skipTest("llguidance not installed")
+        except (ImportError, ValueError):
+            self.skipTest("llguidance not importable")
+        import os
+
+        from llguidance import LLTokenizer
+
+        from sgl_jax.srt.constrained.base_grammar_backend import INVALID_GRAMMAR_OBJ
+        from sgl_jax.srt.constrained.llguidance_backend import GuidanceBackend
+        from sgl_jax.srt.function_call.function_call_parser import FunctionCallParser
+
+        tok_path = os.environ.get("SGL_JAX_TEST_TOKENIZER_JSON")
+        if not tok_path or not os.path.exists(tok_path):
+            self.skipTest("SGL_JAX_TEST_TOKENIZER_JSON not set")
+        calc = make_tool("calculator", {"expression": {"type": "string"}})
+        p = FunctionCallParser([calc], "qwen3_coder")
+        ebnf = p.get_ebnf("required")
+        self.assertIsNotNone(ebnf)
+        tok = LLTokenizer(tok_path)
+        g = GuidanceBackend(tokenizer=tok).dispatch_ebnf(ebnf)
+        self.assertIsNot(g, INVALID_GRAMMAR_OBJ)
+        good = (
+            "<tool_call>\n<function=calculator>\n<parameter=expression>\n"
+            "7*8\n</parameter>\n</function>\n</tool_call>"
+        )
+        for i in tok.greedy_tokenize(good):
+            g.ll_matcher.consume_token(i)
+            if g.ll_matcher.is_error():
+                self.fail(f"native EBNF rejected valid tool call: {g.ll_matcher.get_error()[:300]}")
+        # And the serving-layer parser must extract the call from it.
+        r = p.detector.detect_and_parse(good, [calc])
+        self.assertTrue(r.calls)
+        self.assertEqual(r.calls[0].name, "calculator")
 
 
 if __name__ == "__main__":
